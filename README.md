@@ -82,27 +82,29 @@ run_web.bat
 ```
 policy-qa/
 ├── api.py                    # FastAPI服务
-├── app.py                    # Gradio Web界面
+├── app.py                    # Gradio Web界面（带用户登录）
 ├── qa_chain.py               # QA链构建
 ├── vectorstore.py            # 向量数据库管理
+├── reranker.py               # 重排序模块（BGE-reranker）
 ├── database.py               # 用户认证与对话历史
-├── document_processor.py     # 文档处理与分块
+├── user_vectorstore.py       # 用户个人向量库管理
+├── memory_manager.py         # 记忆分层管理（短期+长期）
 ├── bm25_chinese.py           # 中文BM25检索器
+├── document_processor.py     # 文档处理与分块
+├── document_processor_mineru.py # MinerU文档处理
 ├── config.py                 # 配置管理
-│
-├── evaluation/               # 评估系统
-│   ├── test_set_builder.py   # 测试集构建
-│   ├── offline_evaluation.py # 离线评估
-│   ├── end_to_end_evaluation.py # 端到端评估
-│   └── monitoring.py         # 线上监控
-│
-├── data/                     # 数据目录
-│   └── policy_pdfs/          # 政策PDF文件
 │
 ├── run_api.bat               # 启动API服务
 ├── run_web.bat               # 启动Web界面
-├── run_evaluation.bat        # 运行评估
-└── requirements.txt          # 依赖列表
+├── start.bat                 # 快速启动脚本
+├── view_report.bat           # 查看评估报告
+├── upload_to_github.bat      # GitHub上传脚本
+│
+├── .env.example              # 环境变量模板
+├── .gitignore                # Git忽略配置
+├── requirements.txt          # 依赖列表
+├── README.md                 # 项目说明
+└── EVALUATION_GUIDE.md       # 评估指南
 ```
 
 ## 🔧 配置说明
