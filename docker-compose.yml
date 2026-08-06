@@ -12,7 +12,7 @@ services:
       - hf_cache:/root/.cache/huggingface
     environment:
       - ZHIPU_API_KEY=${ZHIPU_API_KEY}
-      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL:-https://open.bigmodel.cn}
       - LLM_PROVIDER=${LLM_PROVIDER:-zhipu}
       - OPENAI_MODEL=${OPENAI_MODEL:-glm-4-flash}
       - DATA_DIR=data
@@ -20,8 +20,8 @@ services:
       - USE_MINERU=${USE_MINERU:-False}
       - USE_RERANKER=${USE_RERANKER:-True}
       - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-base}
-      - RERANKER_TOP_K=${RERANKER_TOP_K:-3}
-      - RERANKER_THRESHOLD=${RERANKER_THRESHOLD:-0.3}
+      - RERANKER_TOP_K=${RERANKER_TOP_K:-5}
+      - RERANKER_THRESHOLD=${RERANKER_THRESHOLD:-0.0}
       - BM25_WEIGHT=${BM25_WEIGHT:-0.5}
       - VECTOR_WEIGHT=${VECTOR_WEIGHT:-0.5}
       - RETRIEVAL_K=${RETRIEVAL_K:-10}
@@ -103,7 +103,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - ZHIPU_API_KEY=${ZHIPU_API_KEY}
-      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL:-https://open.bigmodel.cn}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}

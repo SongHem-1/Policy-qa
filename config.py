@@ -8,7 +8,7 @@ load_dotenv(ROOT_DIR / ".env")
 ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")).strip()
 ZHIPU_BASE_URL = os.getenv(
     "ZHIPU_BASE_URL",
-    os.getenv("DEEPSEEK_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
+    os.getenv("DEEPSEEK_BASE_URL", "https://open.bigmodel.cn"),
 ).strip()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
@@ -28,12 +28,14 @@ if DATA_DIR and not os.path.isabs(DATA_DIR):
 if PERSIST_DIRECTORY and not os.path.isabs(PERSIST_DIRECTORY):
     PERSIST_DIRECTORY = str((ROOT_DIR / PERSIST_DIRECTORY).resolve())
 
-LOCAL_MODEL_DIR = os.path.join(str(ROOT_DIR), "MML12-v2")
-if os.path.exists(LOCAL_MODEL_DIR):
-    EMBEDDING_MODEL = LOCAL_MODEL_DIR
-    print(f"使用本地嵌入模型: {EMBEDDING_MODEL}")
+# 嵌入模型：优先本地 bge-m3 目录（本地部署），否则回退远程 BAAI/bge-m3
+LOCAL_BGE_M3_DIR = os.path.join(str(ROOT_DIR), "bge-m3")
+if os.path.exists(LOCAL_BGE_M3_DIR):
+    EMBEDDING_MODEL = LOCAL_BGE_M3_DIR
+    print(f"使用本地嵌入模型(bge-m3): {EMBEDDING_MODEL}")
 else:
-    EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    EMBEDDING_MODEL = "BAAI/bge-m3"
+    print("⚠️ 本地 bge-m3 未找到，将使用远程 BAAI/bge-m3（首次加载会下载模型）")
 
 USE_MINERU = os.getenv("USE_MINERU", "False").strip().lower() == "true"
 

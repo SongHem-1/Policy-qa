@@ -18,6 +18,9 @@ import time
 
 from config import USE_KEYWORD_EXTRACT, compute_build_fingerprint
 
+# EasyOCR 模型缓存目录（_ocr_pdf 使用）
+OCR_CACHE_DIR = Path(__file__).resolve().parent / ".easyocr_cache"
+
 
 def split_by_section(documents: List[Document], max_chunk_size: int = 800) -> List[Document]:
     """按章节/条款分块，保持语义完整性

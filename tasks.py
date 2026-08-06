@@ -16,7 +16,6 @@ from config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     DATA_DIR,
-    EMBEDDING_MODEL,
     PARENT_CHUNK_SIZE,
     PERSIST_DIRECTORY,
     REDIS_URL,
@@ -120,13 +119,10 @@ def run_process_user_document(
 ) -> dict:
     """处理用户上传文档：写入用户向量库 + 更新 SQLite 状态"""
     import database
-    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from embeddings import create_embeddings
     from user_vectorstore import process_user_document
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        encode_kwargs={"normalize_embeddings": True},
-    )
+    embeddings = create_embeddings()
     result = process_user_document(
         user_id=user_id,
         file_path=file_path,

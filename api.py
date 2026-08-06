@@ -104,11 +104,8 @@ def get_embeddings():
     global _embeddings_cache
     
     if _embeddings_cache is None:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        _embeddings_cache = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            encode_kwargs={"normalize_embeddings": True},
-        )
+        from embeddings import create_embeddings
+        _embeddings_cache = create_embeddings()
         logger.info("✅ 嵌入模型已初始化并缓存")
     
     return _embeddings_cache

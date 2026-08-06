@@ -284,12 +284,9 @@ def _safe_delete_collection(client, name: str) -> None:
 
 def _load_embeddings():
     """加载嵌入模型"""
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    print("使用 langchain_community.embeddings.HuggingFaceEmbeddings")
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        encode_kwargs={"normalize_embeddings": True},
-    )
+    from embeddings import create_embeddings
+    print("使用本地嵌入模型（bge-m3）")
+    embeddings = create_embeddings()
     print(f"嵌入模型: {EMBEDDING_MODEL}")
     return embeddings
 

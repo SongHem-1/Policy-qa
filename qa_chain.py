@@ -193,12 +193,8 @@ def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document]
                     from api import get_embeddings
                     embeddings = get_embeddings()
                 except ImportError:
-                    from langchain_community.embeddings import HuggingFaceEmbeddings
-                    from config import EMBEDDING_MODEL
-                    embeddings = HuggingFaceEmbeddings(
-                        model_name=EMBEDDING_MODEL,
-                        encode_kwargs={"normalize_embeddings": True},
-                    )
+                    from embeddings import create_embeddings
+                    embeddings = create_embeddings()
                 
                 user_vectorstore = get_user_vectorstore(user_id, embeddings)
                 

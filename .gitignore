@@ -49,6 +49,10 @@ faiss_index/
 .easyocr_cache/
 .cache/
 *.cache
+data/_documents_cache.pkl
+data/_documents_cache.pkl.meta.json
+data/_parent_documents_cache.pkl
+data/_parent_documents_cache.pkl.meta.json
 
 # Logs
 *.log
@@ -62,6 +66,7 @@ data/*.sqlite
 
 # Models (download locally)
 models/
+bge-m3/
 *.pth
 *.bin
 *.safetensors
