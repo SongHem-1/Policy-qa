@@ -37,7 +37,17 @@ services:
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
       - CHUNK_BY_SECTION=${CHUNK_BY_SECTION:-True}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-60}
+      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-3}
+      - SESSION_TTL=${SESSION_TTL:-3600}
     command: uvicorn api:app --host 0.0.0.0 --port 8000
+    depends_on:
+      redis:
+        condition: service_healthy
     # 就绪探针（readiness）：知识库构建完成（status == "ok"）前不对外提供流量，
     # 避免启动期间请求涌入导致超时堆积。
     # Docker Compose 仅支持单个 healthcheck，start_period 承担 startupProbe 的慢启动保护语义；
@@ -67,6 +77,55 @@ services:
       api:
         condition: service_healthy
 
+  redis:
+    image: redis:7-alpine
+    container_name: policy-qa-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: .
+    container_name: policy-qa-worker
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+      - ${MODEL_DIR:-./MML12-v2}:/app/MML12-v2:ro
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - ZHIPU_API_KEY=${ZHIPU_API_KEY}
+      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - DATA_DIR=data
+      - PERSIST_DIRECTORY=chroma_db
+      - USE_MINERU=${USE_MINERU:-False}
+      - USE_PARENT_CHILD=${USE_PARENT_CHILD:-True}
+      - PARENT_CHUNK_SIZE=${PARENT_CHUNK_SIZE:-2000}
+      - CHILD_CHUNK_SIZE=${CHILD_CHUNK_SIZE:-500}
+      - CHILD_CHUNK_OVERLAP=${CHILD_CHUNK_OVERLAP:-50}
+      - USE_METADATA_AUGMENT=${USE_METADATA_AUGMENT:-True}
+      - CHUNK_SIZE=${CHUNK_SIZE:-500}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
+      - CHUNK_BY_SECTION=${CHUNK_BY_SECTION:-True}
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+    command: rq worker policy-qa --url redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
 volumes:
   hf_cache:
+    driver: local
+  redis_data:
     driver: local

@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir --retries 5 \
     && pip install --no-cache-dir --retries 5 \
     -i https://mirrors.aliyun.com/pypi/simple \
     --trusted-host mirrors.aliyun.com \
-    jieba rank_bm25 ragas datasets python-dotenv pydantic numpy structlog \
+    jieba rank_bm25 ragas datasets python-dotenv pydantic numpy structlog redis rq tenacity \
     && pip install --no-cache-dir --retries 5 \
     -i https://mirrors.aliyun.com/pypi/simple \
     --trusted-host mirrors.aliyun.com \
