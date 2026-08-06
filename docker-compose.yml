@@ -82,7 +82,7 @@ services:
     container_name: policy-qa-redis
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${REDIS_PORT:-16379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:

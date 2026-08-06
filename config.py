@@ -19,7 +19,7 @@ PERSIST_DIRECTORY = os.getenv("PERSIST_DIRECTORY", "chroma_db").strip()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "zhipu").strip().lower()
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:16379/0").strip()
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 
 # 如果配置的是相对路径，则默认相对于项目根目录 ROOT_DIR
