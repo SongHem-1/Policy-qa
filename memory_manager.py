@@ -10,11 +10,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-from langchain_zhipu import ChatZhipuAI
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.documents import Document
 
-from config import ZHIPU_API_KEY
+from llm_provider import get_llm_provider
 import database
 
 MEMORY_DB_PATH = Path(__file__).parent / "data" / "memory.db"
@@ -25,7 +24,9 @@ class MemoryManager:
     
     def __init__(self):
         self._init_memory_db()
-        self.llm = ChatZhipuAI(api_key=ZHIPU_API_KEY, model="glm-4-flash")
+        # 供应商抽象：主备降级 + 超时重试由 llm_provider 统一负责
+        self.provider = get_llm_provider()
+        self.llm = self.provider.llm
     
     def _init_memory_db(self):
         """初始化长期记忆数据库"""
@@ -104,7 +105,7 @@ class MemoryManager:
 
 只返回JSON，不要其他内容。"""
 
-            response = self.llm.invoke([HumanMessage(content=prompt)])
+            response = self.provider.invoke(prompt)
             result_text = response.content.strip()
             
             if result_text.startswith("```json"):

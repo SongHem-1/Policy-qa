@@ -10,10 +10,17 @@ ZHIPU_BASE_URL = os.getenv(
     "ZHIPU_BASE_URL",
     os.getenv("DEEPSEEK_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
 ).strip()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "glm-4-flash").strip()
 DATA_DIR = os.getenv("DATA_DIR", "data").strip()
 PERSIST_DIRECTORY = os.getenv("PERSIST_DIRECTORY", "chroma_db").strip()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "zhipu").strip().lower()
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
+SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 
 # 如果配置的是相对路径，则默认相对于项目根目录 ROOT_DIR
 if DATA_DIR and not os.path.isabs(DATA_DIR):

@@ -5,7 +5,6 @@ import sys
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
-from langchain_zhipu import ChatZhipuAI
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
@@ -15,17 +14,33 @@ from langchain.chains.history_aware_retriever import create_history_aware_retrie
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 
 from config import (
-    ZHIPU_API_KEY, 
     USE_RERANKER, 
     RERANKER_TOP_K, 
     RERANKER_THRESHOLD,
     BM25_WEIGHT,
-    VECTOR_WEIGHT
+    VECTOR_WEIGHT,
+    USE_ADAPTIVE_RETRIEVAL,
+    USE_QUERY_EXPANSION,
+    RETRIEVAL_K,
+    USE_PARENT_CHILD,
 )
+from llm_provider import get_llm_provider
 from vectorstore import create_hybrid_retriever
+from query_router import AdaptiveRetriever, STRATEGY_CONFIG
 
 CONTEXTUALIZE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "根据对话历史和用户最新问题，生成一个独立的检索查询（不需要回答，只需要生成检索词）："),
+    ("system", """你的任务是把对话历史+用户最新问题压缩成一个独立的检索查询词。
+
+严格规则：
+1. 只输出查询词，不超过30个字
+2. 禁止回答问题、禁止生成步骤、禁止给出建议
+3. 如果用户最新问题已经是一个独立问题，直接输出它
+4. 如果用户问题依赖历史上下文，融合历史信息后输出查询词
+
+示例：
+- 用户问"怎么做"而历史在讨论海运 → 输出"从事海运业务的条件和流程"
+- 用户问"第三条税率"而历史在讨论增值税法 → 输出"增值税法第三条税率规定"
+- 用户问"小微企业税收优惠" → 直接输出"小微企业税收优惠"（不需要改）"""),
     MessagesPlaceholder("chat_history"),
     ("human", "{input}"),
 ])
@@ -91,33 +106,68 @@ def format_docs_with_citations(docs: List[Document]) -> str:
     return "\n".join(formatted_docs)
 
 
-def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document] = None, user_id: int = None):
+def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document] = None, user_id: int = None, parent_documents: List[Document] = None):
     """构建支持多轮对话的检索问答链
     
     Args:
         vectorstore: 向量数据库（公用数据库）
         documents: 原始文档列表（用于BM25混合检索）
         user_id: 用户ID（如果提供，将同时检索用户个人数据库）
+        parent_documents: 父块文档列表（用于ParentChildRetriever）
     
     Returns:
         支持对话历史的检索问答链
     """
-    llm = ChatZhipuAI(
-        api_key=ZHIPU_API_KEY,
-        model="glm-4-flash"
-    )
+    # 策略模式：通过供应商抽象获取模型实例，主备降级与超时重试由 llm_provider 层负责
+    llm_provider = get_llm_provider()
+    llm = llm_provider.llm
     
-    # 创建公用数据库检索器
-    public_retriever = create_hybrid_retriever(
-        vectorstore, 
-        documents, 
-        k=3,
-        use_reranker=USE_RERANKER,
-        reranker_top_k=RERANKER_TOP_K,
-        reranker_threshold=RERANKER_THRESHOLD,
-        bm25_weight=BM25_WEIGHT,
-        vector_weight=VECTOR_WEIGHT
-    )
+    # 创建检索器
+    if USE_ADAPTIVE_RETRIEVAL and documents:
+        # 自适应检索模式：为每种策略创建不同的检索器
+        retrievers = {}
+        for strategy, cfg in STRATEGY_CONFIG.items():
+            ret = create_hybrid_retriever(
+                vectorstore,
+                documents,
+                k=RETRIEVAL_K,
+                use_reranker=USE_RERANKER,
+                reranker_top_k=RERANKER_TOP_K,
+                reranker_threshold=RERANKER_THRESHOLD,
+                bm25_weight=cfg["bm25_weight"],
+                vector_weight=cfg["vector_weight"]
+            )
+            retrievers[strategy] = ret
+        
+        public_retriever = AdaptiveRetriever(
+            retrievers=retrievers,
+            llm=llm_provider,
+            use_expansion=USE_QUERY_EXPANSION,
+            default_strategy="混合"
+        )
+        print(f"✅ 自适应检索器已启用（{len(retrievers)} 种策略，查询扩展: {'开启' if USE_QUERY_EXPANSION else '关闭'}）")
+    else:
+        # 传统固定权重模式
+        public_retriever = create_hybrid_retriever(
+            vectorstore, 
+            documents, 
+            k=RETRIEVAL_K,
+            use_reranker=USE_RERANKER,
+            reranker_top_k=RERANKER_TOP_K,
+            reranker_threshold=RERANKER_THRESHOLD,
+            bm25_weight=BM25_WEIGHT,
+            vector_weight=VECTOR_WEIGHT
+        )
+        print("⚠️ 使用固定权重混合检索（自适应检索已禁用）")
+    
+    # 如果启用父子块检索，用ParentChildRetriever包装基础检索器
+    if USE_PARENT_CHILD and parent_documents:
+        from vectorstore import ParentChildRetriever
+        public_retriever = ParentChildRetriever(
+            base_retriever=public_retriever,
+            parent_documents=parent_documents
+        )
+        print(f"✅ 父子块检索已启用（子块检索 → 父块返回，{len(parent_documents)} 个父块）")
     
     # 如果有用户ID，创建联合检索器
     if user_id:
@@ -125,38 +175,51 @@ def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document]
             from user_vectorstore import get_user_vectorstore
             from vectorstore import CombinedRetriever
             
-            # 使用缓存的嵌入模型
+            # 先查数据库，确认用户是否真的上传过文件
+            has_db_uploads = False
             try:
-                from api import get_embeddings
-                embeddings = get_embeddings()
-            except ImportError:
-                # 如果无法导入，直接创建
-                from langchain_huggingface import HuggingFaceEmbeddings
-                from config import EMBEDDING_MODEL
-                embeddings = HuggingFaceEmbeddings(
-                    model_name=EMBEDDING_MODEL,
-                    encode_kwargs={"normalize_embeddings": True},
-                )
+                from database import get_user_uploads
+                uploads = get_user_uploads(user_id)
+                has_db_uploads = len(uploads) > 0
+            except Exception:
+                has_db_uploads = False  # 数据库异常时安全起见，不加载用户库
             
-            user_vectorstore = get_user_vectorstore(user_id, embeddings)
-            
-            if user_vectorstore:
-                user_retriever = user_vectorstore.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": 3}
-                )
-                
-                # 创建联合检索器
-                retriever = CombinedRetriever(
-                    public_retriever=public_retriever,
-                    user_retriever=user_retriever,
-                    public_weight=0.7,
-                    user_weight=0.3
-                )
-                print(f"✅ 用户 {user_id}: 使用联合检索器（公用+个人数据库）")
-            else:
+            if not has_db_uploads:
                 retriever = public_retriever
-                print(f"⚠️ 用户 {user_id}: 个人数据库为空，仅使用公用数据库")
+                print(f"⚠️ 用户 {user_id}: 数据库无上传记录，跳过个人数据库")
+            else:
+                # 使用缓存的嵌入模型
+                try:
+                    from api import get_embeddings
+                    embeddings = get_embeddings()
+                except ImportError:
+                    from langchain_community.embeddings import HuggingFaceEmbeddings
+                    from config import EMBEDDING_MODEL
+                    embeddings = HuggingFaceEmbeddings(
+                        model_name=EMBEDDING_MODEL,
+                        encode_kwargs={"normalize_embeddings": True},
+                    )
+                
+                user_vectorstore = get_user_vectorstore(user_id, embeddings)
+                
+                if user_vectorstore:
+                    user_retriever = create_hybrid_retriever(
+                        user_vectorstore,
+                        documents=None,  # 用户文档不参与BM25（避免重复）
+                        k=RETRIEVAL_K,
+                        use_reranker=False  # 用户文档少，不重排序
+                    )
+                    
+                    retriever = CombinedRetriever(
+                        public_retriever=public_retriever,
+                        user_retriever=user_retriever,
+                        public_weight=0.7,
+                        user_weight=0.15
+                    )
+                    print(f"✅ 用户 {user_id}: 联合检索器（公用+{len(uploads)}个个人文档）")
+                else:
+                    retriever = public_retriever
+                    print(f"⚠️ 用户 {user_id}: 个人向量库为空，仅使用公用数据库")
         except Exception as e:
             print(f"⚠️ 创建用户检索器失败: {e}，仅使用公用数据库")
             retriever = public_retriever
@@ -202,18 +265,24 @@ def invoke_chain_with_memory(
     })
 
 
-def build_retrieval_qa_chain(vectorstore: Chroma, documents: List[Document] = None, user_id: int = None):
+def build_retrieval_qa_chain(vectorstore: Chroma, documents: List[Document] = None, user_id: int = None, parent_documents: List[Document] = None):
     """构建检索问答链（兼容旧版本）
     
     Args:
         vectorstore: 向量数据库
         documents: 原始文档列表（用于BM25混合检索）
         user_id: 用户ID（可选）
+        parent_documents: 父块文档列表（用于ParentChildRetriever）
     
     Returns:
         支持对话历史的检索问答链
     """
-    return build_conversational_qa_chain(vectorstore, documents=documents, user_id=user_id)
+    return build_conversational_qa_chain(
+        vectorstore, 
+        documents=documents, 
+        user_id=user_id,
+        parent_documents=parent_documents
+    )
 
 
 def format_chat_history(history: List) -> List[BaseMessage]:
