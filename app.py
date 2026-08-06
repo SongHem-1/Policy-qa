@@ -29,10 +29,12 @@ from config import LLM_MODEL, validate_config
 
 import database
 
-API_BASE_URL = "http://127.0.0.1:8000/api/v1"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000/api/v1")
 
 _current_user: Optional[Dict[str, Any]] = None
 _current_conversation_id: Optional[int] = None
+_current_session_id: Optional[str] = None        # 当前对话对应的会话ID（登录后独立创建）
+_conversation_sessions: Dict[int, str] = {}      # conversation_id -> session_id 映射
 
 
 def api_request(endpoint: str, method: str = "GET", data: dict = None) -> dict:
@@ -79,7 +81,7 @@ def register_user(username: str, password: str) -> Tuple[str, str]:
 
 def login_user(username: str, password: str) -> Tuple[str, str, gr.update, gr.update, gr.update, str]:
     """用户登录"""
-    global _current_user
+    global _current_user, _current_session_id
     
     if not username or not password:
         return "请输入用户名和密码", "", gr.update(), gr.update(), gr.update(), ""
@@ -94,6 +96,10 @@ def login_user(username: str, password: str) -> Tuple[str, str, gr.update, gr.up
             "user_id": result.get("user_id"),
             "username": result.get("username")
         }
+        
+        # 每个登录用户创建独立会话，不再共用 web_session
+        session_res = api_request("/session", "POST", {})
+        _current_session_id = session_res.get("session_id")
         
         conversations = load_user_conversations()
         
@@ -111,10 +117,12 @@ def login_user(username: str, password: str) -> Tuple[str, str, gr.update, gr.up
 
 def logout_user() -> Tuple[str, gr.update, gr.update, gr.update, gr.update, str]:
     """用户登出"""
-    global _current_user, _current_conversation_id
+    global _current_user, _current_conversation_id, _current_session_id, _conversation_sessions
     
     _current_user = None
     _current_conversation_id = None
+    _current_session_id = None
+    _conversation_sessions = {}
     
     return (
         "已登出",
@@ -128,7 +136,7 @@ def logout_user() -> Tuple[str, gr.update, gr.update, gr.update, gr.update, str]
 
 def load_user_conversations() -> List[str]:
     """加载用户的对话列表"""
-    global _current_user
+    global _current_user, _conversation_sessions
     
     if not _current_user:
         return []
@@ -137,7 +145,9 @@ def load_user_conversations() -> List[str]:
     
     if isinstance(result, list):
         conversations = []
+        _conversation_sessions.clear()
         for conv in result:
+            _conversation_sessions[conv["id"]] = conv.get("session_id", "")
             conversations.append(f"[{conv['id']}] {conv['title']} ({conv['message_count']}条消息)")
         return conversations
     return []
@@ -145,7 +155,7 @@ def load_user_conversations() -> List[str]:
 
 def create_new_conversation() -> Tuple[str, gr.update]:
     """创建新对话"""
-    global _current_user, _current_conversation_id
+    global _current_user, _current_conversation_id, _current_session_id, _conversation_sessions
     
     if not _current_user:
         return "请先登录", gr.update()
@@ -154,6 +164,10 @@ def create_new_conversation() -> Tuple[str, gr.update]:
     
     if result.get("id"):
         _current_conversation_id = result["id"]
+        # 新对话使用服务端分配的独立 session_id，多轮上下文互不串扰
+        _current_session_id = result.get("session_id") or _current_session_id
+        if _current_session_id:
+            _conversation_sessions[_current_conversation_id] = _current_session_id
         conversations = load_user_conversations()
         return f"✅ 创建新对话 (ID: {_current_conversation_id})", gr.update(choices=conversations, value=None)
     
@@ -162,7 +176,7 @@ def create_new_conversation() -> Tuple[str, gr.update]:
 
 def select_conversation(choice: str) -> Tuple[List, str]:
     """选择对话"""
-    global _current_conversation_id
+    global _current_conversation_id, _current_session_id
     
     if not choice:
         return [], ""
@@ -170,6 +184,7 @@ def select_conversation(choice: str) -> Tuple[List, str]:
     try:
         conv_id = int(choice.split("[")[1].split("]")[0])
         _current_conversation_id = conv_id
+        _current_session_id = _conversation_sessions.get(conv_id) or _current_session_id
         
         result = api_request(f"/conversations/{conv_id}")
         
@@ -216,6 +231,8 @@ def delete_current_conversation() -> Tuple[str, gr.update, gr.update]:
 
 def answer_query(user_message: str) -> Tuple[str, List[str]]:
     """回答问题 - 通过API服务"""
+    global _current_session_id
+
     if not user_message.strip():
         return "请输入要查询的问题。", []
     
@@ -226,10 +243,15 @@ def answer_query(user_message: str) -> Tuple[str, List[str]]:
     
     try:
         print(f"正在处理查询：{user_message[:50]}...")
+
+        # 确保有独立的会话ID（登录后由 /session 创建），不再共享 web_session
+        if not _current_session_id:
+            session_res = api_request("/session", "POST", {})
+            _current_session_id = session_res.get("session_id")
         
         request_data = {
             "question": user_message,
-            "session_id": "web_session",
+            "session_id": _current_session_id or "",
             "include_history": True
         }
         
@@ -290,7 +312,7 @@ def respond(user_message: str, chat_history: List):
 
 
 def refresh_files():
-    """刷新知识库 - 通过API服务"""
+    """刷新知识库 - 通过API服务（增量更新）"""
     try:
         result = api_request("/rebuild", "POST", {})
         
@@ -309,6 +331,24 @@ def refresh_files():
             return f"❌ 刷新失败：{message}", gr.update()
     except Exception as e:
         return f"❌ 刷新失败：{e}", gr.update()
+
+
+def force_rebuild():
+    """强制完全重建知识库 - 通过API服务"""
+    try:
+        result = api_request("/rebuild?force=true", "POST", {})
+        
+        status = result.get("status", "")
+        message = result.get("message", "")
+        
+        if status == "started":
+            return f"🔨 {message}\n\n⏳ 正在完全重建知识库，请等待约30秒-2分钟后刷新页面查看结果...", gr.update()
+        elif status == "loading":
+            return f"⏳ {message}", gr.update()
+        else:
+            return f"❌ 强制重建失败：{message}", gr.update()
+    except Exception as e:
+        return f"❌ 强制重建失败：{e}", gr.update()
 
 
 def upload_user_document(file):
@@ -542,7 +582,8 @@ with gr.Blocks(title="国家政策知识库智能问答") as demo:
                 submit_btn = gr.Button("发送", variant="primary", scale=1)
             
             with gr.Row():
-                refresh_btn = gr.Button("🔄 刷新知识库")
+                refresh_btn = gr.Button("🔄 刷新知识库", scale=1)
+                force_rebuild_btn = gr.Button("🔨 强制完全重建", scale=1, variant="stop")
                 status_display = gr.Markdown(get_system_status())
     
     register_btn.click(
@@ -608,6 +649,18 @@ with gr.Blocks(title="国家政策知识库智能问答") as demo:
         outputs=[status_display]
     )
     
+    force_rebuild_btn.click(
+        force_rebuild,
+        outputs=[conversation_status, chatbot]
+    ).then(
+        lambda: None,
+        inputs=None,
+        outputs=None
+    ).then(
+        lambda: gr.update(value=get_system_status()),
+        outputs=[status_display]
+    )
+    
     upload_btn.click(
         upload_user_document,
         inputs=[upload_file],
@@ -658,7 +711,7 @@ if __name__ == "__main__":
     
     demo.launch(
         share=False,
-        server_name="127.0.0.1",
-        server_port=7862,
+        server_name=os.getenv("GRADIO_SERVER_NAME", "127.0.0.1"),
+        server_port=int(os.getenv("GRADIO_SERVER_PORT", "7862")),
         favicon_path=None,
     )

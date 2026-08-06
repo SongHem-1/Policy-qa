@@ -36,7 +36,6 @@ from config import (
     USE_MINERU,
     DOC_PROCESSOR as CONFIG_DOC_PROCESSOR,
     EMBEDDING_MODEL,
-    compute_build_fingerprint,
 )
 import database
 from user_vectorstore import (
@@ -66,6 +65,9 @@ else:
 from vectorstore import build_or_load_vectorstore, read_manifest, update_manifest_count
 from qa_chain import build_retrieval_qa_chain, extract_sources, extract_cited_sources, invoke_chain_with_memory
 from logging_config import setup_logging, new_trace_id, bind_trace_id, clear_trace_id
+from cache_utils import load_cache_with_meta, save_cache_with_meta
+from session_store import session_store
+from tasks import enqueue_rebuild, enqueue_process_user_document, fetch_job
 
 logger = logging.getLogger("policy_qa_api")
 _request_logger = structlog.get_logger("policy_qa_api.request")
@@ -92,10 +94,9 @@ _parent_documents = None  # 保存父块文档用于ParentChildRetriever
 _embeddings_cache = None
 _user_retrievers_cache: dict = {}  # {user_id: chain}
 
-_session_store: dict = {}
-_session_timestamps: dict = {}
-MAX_SESSIONS = 100
-SESSION_TIMEOUT = 3600
+# RQ 任务跟踪：重建任务完成后 API 惰性重载检索链；用户文档任务完成后失效对应检索器缓存
+_rebuild_task_id: Optional[str] = None
+_pending_user_tasks: dict = {}  # {user_id: task_id}
 
 
 def get_embeddings():
@@ -113,72 +114,9 @@ def get_embeddings():
     return _embeddings_cache
 
 
-def _cleanup_expired_sessions():
-    current_time = time.time()
-    expired = [
-        sid for sid, ts in _session_timestamps.items()
-        if current_time - ts > SESSION_TIMEOUT
-    ]
-    for sid in expired:
-        _session_store.pop(sid, None)
-        _session_timestamps.pop(sid, None)
-    if expired:
-        logger.info(f"清理了 {len(expired)} 个过期会话")
-
-
 def _ensure_directories() -> None:
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     Path(PERSIST_DIRECTORY).mkdir(parents=True, exist_ok=True)
-
-
-def _cache_meta_path(cache_path: Path) -> Path:
-    """缓存指纹边车路径：_documents_cache.pkl -> _documents_cache.pkl.meta.json"""
-    return cache_path.with_suffix(cache_path.suffix + ".meta.json")
-
-
-def _save_cache_with_meta(cache_path: Path, data) -> None:
-    """保存 pickle 缓存并写入指纹边车，供加载时与向量库 manifest 互验"""
-    import pickle
-    with open(cache_path, "wb") as f:
-        pickle.dump(data, f)
-    meta = {"fingerprint": compute_build_fingerprint(), "created_at": time.time()}
-    with open(_cache_meta_path(cache_path), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
-    logger.info(f"缓存已保存: {cache_path.name}（指纹 {meta['fingerprint']}）")
-
-
-def _load_cache_with_meta(cache_path: Path, manifest: Optional[dict]):
-    """加载缓存并校验指纹与向量库 manifest 一致；不一致返回 None（绝不静默使用旧缓存）"""
-    if not cache_path.exists():
-        return None
-    import pickle
-    try:
-        meta_path = _cache_meta_path(cache_path)
-        if not meta_path.exists():
-            logger.warning(f"缓存缺少指纹元数据，已跳过: {cache_path.name}")
-            return None
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        cache_fp = meta.get("fingerprint")
-        manifest_fp = (manifest or {}).get("fingerprint") if manifest else None
-
-        if manifest_fp is None:
-            # 旧库无清单：只信任与当前构建配置一致的缓存
-            if cache_fp != compute_build_fingerprint():
-                logger.warning(f"缓存指纹与当前构建配置不一致，已跳过: {cache_path.name}")
-                return None
-        elif not cache_fp or cache_fp != manifest_fp:
-            logger.warning(f"缓存指纹与向量库 manifest 不一致，已跳过: {cache_path.name}")
-            return None
-
-        if cache_fp != compute_build_fingerprint():
-            logger.warning(f"⚠️ 缓存与当前构建配置不一致（配置已变更），建议重建知识库: {cache_path.name}")
-
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-    except Exception as e:
-        logger.warning(f"缓存加载失败: {cache_path.name} - {e}")
-        return None
 
 
 def _build_chain():
@@ -200,7 +138,7 @@ def _build_chain():
             # 从缓存加载原始文档（用于BM25和自适应检索），指纹校验不通过则降级为纯向量检索
             manifest = read_manifest(PERSIST_DIRECTORY)
             cache_path = Path(DATA_DIR) / "_documents_cache.pkl"
-            cached_docs = _load_cache_with_meta(cache_path, manifest)
+            cached_docs = load_cache_with_meta(cache_path, manifest)
             if cached_docs:
                 _original_documents = cached_docs
                 logger.info(f"从缓存加载 {len(cached_docs)} 个文档块（指纹校验通过）")
@@ -211,7 +149,7 @@ def _build_chain():
             # 加载父块缓存（用于ParentChildRetriever）
             parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
             if USE_PARENT_CHILD:
-                _parent_documents = _load_cache_with_meta(parent_cache_path, manifest)
+                _parent_documents = load_cache_with_meta(parent_cache_path, manifest)
                 if _parent_documents:
                     logger.info(f"从缓存加载 {len(_parent_documents)} 个父块（指纹校验通过）")
                 else:
@@ -250,12 +188,12 @@ def _build_chain():
     
     # 保存原始文档用于BM25混合检索，并缓存到磁盘
     _original_documents = documents
-    _save_cache_with_meta(Path(DATA_DIR) / "_documents_cache.pkl", documents)
+    save_cache_with_meta(Path(DATA_DIR) / "_documents_cache.pkl", documents)
     
     # 加载父块缓存（由load_and_split_pdfs自动保存，已带指纹边车）
     if USE_PARENT_CHILD:
         parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
-        _parent_documents = _load_cache_with_meta(parent_cache_path, read_manifest(PERSIST_DIRECTORY))
+        _parent_documents = load_cache_with_meta(parent_cache_path, read_manifest(PERSIST_DIRECTORY))
         if _parent_documents:
             logger.info(f"父块缓存已加载: {len(_parent_documents)} 个父块")
         else:
@@ -273,8 +211,50 @@ def _build_chain():
     logger.info(f"检索链构建完成，已加载文件：{_file_list}")
 
 
+def _reload_chain_async():
+    """重建任务完成后在后台从磁盘重载检索链（读盘 + 构建检索器）"""
+    global _chain_building
+    _chain_building = True
+    try:
+        _build_chain()
+    finally:
+        _chain_building = False
+
+
+def _refresh_user_task_cache(user_id: int) -> None:
+    """用户文档任务结束后失效该用户的检索器缓存"""
+    task_id = _pending_user_tasks.get(user_id)
+    if not task_id:
+        return
+    try:
+        job = fetch_job(task_id)
+        status = job.get_status() if job is not None else "finished"
+        if status in ("finished", "failed"):
+            _user_retrievers_cache.pop(user_id, None)
+            _pending_user_tasks.pop(user_id, None)
+            logger.info(f"用户 {user_id} 文档任务 {status}，检索器缓存已失效")
+    except Exception as e:
+        logger.warning(f"检查用户任务状态失败: {e}")
+
+
 def _ensure_chain(wait: bool = False, timeout: int = 60):
-    global _chain, _file_list, _chain_building, _chain_error, _build_start_time
+    global _chain, _file_list, _chain_building, _chain_error, _build_start_time, _rebuild_task_id
+
+    # 重建任务完成 -> 后台重载检索链（双缓冲区保证旧库服务到切换完成）
+    if _rebuild_task_id and _chain is not None:
+        try:
+            job = fetch_job(_rebuild_task_id)
+            if job is not None and job.get_status() in ("finished", "failed"):
+                status = job.get_status()
+                _rebuild_task_id = None
+                if status == "finished":
+                    logger.info("重建任务完成，后台重载检索链")
+                    threading.Thread(target=_reload_chain_async, daemon=True).start()
+                else:
+                    _chain_error = "知识库重建失败，请查看任务状态"
+                    logger.error(f"重建任务失败: {job.exc_info}")
+        except Exception as e:
+            logger.warning(f"检查重建任务状态失败: {e}")
 
     if _chain is not None:
         return _chain, _file_list
@@ -327,6 +307,8 @@ class HealthResponse(BaseModel):
     doc_processor: str = Field(..., description="当前文档处理器")
     data_dir: str = Field(..., description="数据目录路径")
     persist_dir: str = Field(..., description="向量数据库路径")
+    rebuild_task_id: Optional[str] = Field(None, description="进行中的重建任务ID")
+    rebuild_status: Optional[str] = Field(None, description="重建任务状态")
 
 class FileListResponse(BaseModel):
     files: List[str] = Field(default_factory=list, description="已加载文件列表")
@@ -454,6 +436,13 @@ async def request_logging(request: Request, call_next):
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["系统"])
 async def health_check():
     """健康检查端点，返回服务状态与知识库信息。"""
+    rebuild_status = None
+    if _rebuild_task_id:
+        try:
+            job = fetch_job(_rebuild_task_id)
+            rebuild_status = job.get_status() if job is not None else "finished"
+        except Exception:
+            rebuild_status = "unknown"
     return HealthResponse(
         status="ok" if _chain is not None else "loading",
         chain_ready=_chain is not None,
@@ -462,6 +451,8 @@ async def health_check():
         doc_processor=DOC_PROCESSOR,
         data_dir=DATA_DIR,
         persist_dir=PERSIST_DIRECTORY,
+        rebuild_task_id=_rebuild_task_id,
+        rebuild_status=rebuild_status,
     )
 
 
@@ -493,11 +484,11 @@ async def query(req: QueryRequest):
         raise HTTPException(status_code=503, detail="知识库未就绪")
 
     try:
-        _cleanup_expired_sessions()
+        session_store.cleanup_expired()
         
         chat_history = []
         if req.session_id and req.include_history:
-            chat_history = _session_store.get(req.session_id, []).copy()
+            chat_history = session_store.get(req.session_id)
             logger.info(f"会话 {req.session_id}: 加载 {len(chat_history)} 条历史")
         
         logger.info(f"处理查询: {req.question[:50]}...")
@@ -514,6 +505,7 @@ async def query(req: QueryRequest):
         
         # 如果有用户ID，使用缓存的用户检索器
         if req.user_id:
+            _refresh_user_task_cache(req.user_id)
             try:
                 if req.user_id not in _user_retrievers_cache:
                     # 构建新的检索器（内部会自动判断用户是否有个人文档）
@@ -566,21 +558,10 @@ async def query(req: QueryRequest):
         sources = extract_sources(source_documents[:3]) if source_documents else []
         
         if req.session_id:
-            _session_store.setdefault(req.session_id, []).append({
-                "role": "user",
-                "content": req.question
-            })
-            _session_store[req.session_id].append({
-                "role": "assistant",
-                "content": answer_text.strip()
-            })
-            _session_timestamps[req.session_id] = time.time()
-            
-            if len(_session_store) > MAX_SESSIONS:
-                oldest_sid = min(_session_timestamps.items(), key=lambda x: x[1])[0]
-                _session_store.pop(oldest_sid, None)
-                _session_timestamps.pop(oldest_sid, None)
-                logger.info(f"达到最大会话数，清理最旧会话: {oldest_sid}")
+            session_store.extend(req.session_id, [
+                {"role": "user", "content": req.question},
+                {"role": "assistant", "content": answer_text.strip()},
+            ])
         
         if req.user_id and req.session_id and MEMORY_ENABLED and memory_manager:
             try:
@@ -607,181 +588,63 @@ async def list_files():
 @app.post("/api/v1/rebuild", response_model=RebuildResponse, tags=["知识库"])
 async def rebuild_knowledge_base(force: bool = Query(default=False, description="是否强制完全重建")):
     """
-    刷新知识库（智能增量更新）。
-    
-    - 默认：智能检测文件变化，只处理新增/删除的文件（增量更新）
-    - force=True：强制完全重建所有文档
+    刷新知识库（RQ 异步任务，双缓冲区原子重建）。
+
+    - 返回 task_id，可通过 /api/v1/tasks/{task_id} 轮询状态
+    - 任务完成后 API 自动重载检索链；重建期间旧知识库继续服务
     """
-    global _chain, _file_list, _chain_building, _chain_error
+    global _rebuild_task_id
 
     if _chain_building:
-        return RebuildResponse(status="loading", message="知识库正在构建中，请稍后")
+        return RebuildResponse(status="loading", message="知识库正在初始化中，请稍后")
 
-    if force:
-        # 强制完全重建
-        _chain = None
-        _chain_error = None
-        _chain_building = True
+    if _rebuild_task_id:
+        return RebuildResponse(status="loading", message=f"已有重建任务进行中: {_rebuild_task_id}")
 
-        def _rebuild():
-            global _chain, _file_list, _chain_building, _chain_error
-            
-            try:
-                logger.info("开始强制完全重建知识库...")
-                documents = load_and_split_pdfs(
-                    DATA_DIR, 
-                    chunk_size=CHUNK_SIZE, 
-                    overlap=CHUNK_OVERLAP,
-                    parent_child=USE_PARENT_CHILD,
-                    parent_size=PARENT_CHUNK_SIZE,
-                    child_size=CHILD_CHUNK_SIZE,
-                    child_overlap=CHILD_CHUNK_OVERLAP,
-                    augment_meta=USE_METADATA_AUGMENT,
-                )
-                if not documents:
-                    _chain_error = "没有找到可用文档"
-                    _chain_building = False
-                    return
-                vectorstore = build_or_load_vectorstore(documents, force_rebuild=True)
-                
-                global _original_documents, _parent_documents
-                _original_documents = documents
-                _save_cache_with_meta(Path(DATA_DIR) / "_documents_cache.pkl", documents)
-                
-                # 加载父块缓存（带指纹校验）
-                if USE_PARENT_CHILD:
-                    parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
-                    _parent_documents = _load_cache_with_meta(parent_cache_path, read_manifest(PERSIST_DIRECTORY))
-                
-                qa = build_retrieval_qa_chain(
-                    vectorstore, 
-                    documents=documents,
-                    parent_documents=_parent_documents
-                )
-                _file_list = sorted({doc.metadata.get("source", "未知来源") for doc in documents})
-                _chain = qa
-                logger.info(f"完全重建完成，共加载 {len(_file_list)} 个文件")
-            except Exception as exc:
-                _chain_error = str(exc)
-                logger.error(f"重建失败: {exc}")
-            finally:
-                _chain_building = False
-
-        threading.Thread(target=_rebuild, daemon=True).start()
-        return RebuildResponse(status="started", message="知识库完全重建已启动，请通过 /health 查看进度")
-    
-    else:
-        # 智能增量更新
+    if not force:
         data_path = Path(DATA_DIR)
         current_pdfs = sorted([f.name for f in data_path.glob("*.pdf")]) if data_path.exists() else []
-        
         if set(current_pdfs) == set(_file_list):
             return RebuildResponse(status="ready", message="文件未变化，无需更新")
-        
-        old_set = set(_file_list)
-        new_set = set(current_pdfs)
-        
-        added_files = new_set - old_set
-        removed_files = old_set - new_set
-        
-        logger.info(f"检测到文件变化：新增 {len(added_files)} 个，删除 {len(removed_files)} 个")
-        
-        if not added_files and not removed_files:
-            return RebuildResponse(status="ready", message="文件未变化，无需更新")
-        
-        _chain = None
-        _chain_error = None
-        _chain_building = True
-        
-        def _incremental_update():
-            global _chain, _file_list, _chain_building, _chain_error
-            
-            try:
-                logger.info(f"开始增量更新：新增 {len(added_files)} 个文件")
-                
-                import tempfile
-                import shutil
-                from langchain_community.embeddings import HuggingFaceEmbeddings
-                
-                embeddings = HuggingFaceEmbeddings(
-                    model_name=EMBEDDING_MODEL,
-                    encode_kwargs={"normalize_embeddings": True},
-                )
-                
-                vectorstore = build_or_load_vectorstore([], force_rebuild=False)
-                
-                if added_files:
-                    temp_dir = tempfile.mkdtemp(prefix="policy_new_")
-                    try:
-                        for pdf_file in added_files:
-                            src_file = data_path / pdf_file
-                            dst_file = Path(temp_dir) / pdf_file
-                            shutil.copy2(src_file, dst_file)
-                        
-                        new_documents = load_and_split_pdfs(
-                            temp_dir, 
-                            chunk_size=CHUNK_SIZE, 
-                            overlap=CHUNK_OVERLAP,
-                            parent_child=USE_PARENT_CHILD,
-                            parent_size=PARENT_CHUNK_SIZE,
-                            child_size=CHILD_CHUNK_SIZE,
-                            child_overlap=CHILD_CHUNK_OVERLAP,
-                            augment_meta=USE_METADATA_AUGMENT,
-                        )
-                        
-                        if new_documents:
-                            # 去重：基于内容哈希
-                            import hashlib
-                            unique_docs = []
-                            seen_hashes = set()
-                            
-                            for doc in new_documents:
-                                content_hash = hashlib.md5(doc.page_content.encode()).hexdigest()
-                                if content_hash not in seen_hashes:
-                                    seen_hashes.add(content_hash)
-                                    unique_docs.append(doc)
-                            
-                            logger.info(f"去重前: {len(new_documents)} 个文档块")
-                            logger.info(f"去重后: {len(unique_docs)} 个唯一文档块")
-                            
-                            if unique_docs:
-                                vectorstore.add_documents(unique_docs)
-                                update_manifest_count(vectorstore, PERSIST_DIRECTORY)
-                                logger.info(f"已添加 {len(unique_docs)} 个唯一文档块")
-                        
-                        global _original_documents
-                        if _original_documents is None:
-                            _original_documents = []
-                        _original_documents.extend(new_documents)
-                        _save_cache_with_meta(Path(DATA_DIR) / "_documents_cache.pkl", _original_documents)
-                        
-                    finally:
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                
-                if removed_files:
-                    logger.info(f"已删除 {len(removed_files)} 个文件（向量库中数据保留）")
-                
-                qa = build_retrieval_qa_chain(
-                    vectorstore, 
-                    documents=_original_documents,
-                    parent_documents=_parent_documents
-                )
-                _file_list = current_pdfs
-                _chain = qa
-                
-                logger.info(f"增量更新完成，当前共 {len(_file_list)} 个文件")
-                
-            except Exception as exc:
-                _chain_error = str(exc)
-                logger.error(f"增量更新失败: {exc}")
-            finally:
-                _chain_building = False
-        
-        threading.Thread(target=_incremental_update, daemon=True).start()
-        return RebuildResponse(
-            status="started", 
-            message=f"增量更新已启动（新增 {len(added_files)} 个，删除 {len(removed_files)} 个），请通过 /health 查看进度"
-        )
+
+    try:
+        task = enqueue_rebuild(force=force)
+    except Exception as e:
+        logger.error(f"重建任务入队失败: {e}")
+        raise HTTPException(status_code=503, detail="任务队列不可用，请确认 Redis 与 worker 已启动")
+
+    _rebuild_task_id = task.id
+    logger.info(f"重建任务已入队: {task.id}（force={force}）")
+    return RebuildResponse(
+        status="started",
+        message=f"重建任务已启动: {task.id}，可通过 /api/v1/tasks/{task.id} 轮询状态"
+    )
+
+
+@app.get("/api/v1/tasks/{task_id}", tags=["任务"])
+async def get_task_status(task_id: str):
+    """
+    RQ 任务状态轮询接口。
+
+    - status: queued / started / finished / failed
+    - finished 时返回 result；failed 时返回精简错误信息（不暴露堆栈）
+    """
+    try:
+        job = fetch_job(task_id)
+    except Exception as e:
+        logger.warning(f"任务查询失败: {task_id} - {e}")
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+    status = job.get_status()
+    result = job.result if status == "finished" else None
+    error = None
+    if status == "failed" and job.exc_info:
+        error = str(job.exc_info).strip().splitlines()[-1][:300]
+
+    return {"task_id": task_id, "status": status, "result": result, "error": error}
 
 
 @app.get("/api/v1/search", tags=["检索"])
@@ -824,19 +687,16 @@ async def search_documents(
 async def create_session():
     """
     创建新会话。
-    
+
     - 返回唯一的session_id用于后续多轮对话
-    - 会话默认1小时后过期
+    - Redis 后端由 TTL 自动过期（默认1小时）
     """
-    import uuid
-    session_id = str(uuid.uuid4())
-    _session_store[session_id] = []
-    _session_timestamps[session_id] = time.time()
+    session_id = session_store.create()
     logger.info(f"创建新会话: {session_id}")
     return SessionInfo(
         session_id=session_id,
         message_count=0,
-        created_at=_session_timestamps[session_id]
+        created_at=time.time()
     )
 
 
@@ -844,16 +704,16 @@ async def create_session():
 async def get_session(session_id: str):
     """
     查询会话信息。
-    
-    - 返回会话的消息数量和创建时间
+
+    - 返回会话的消息数量
     """
-    if session_id not in _session_store:
+    if not session_store.exists(session_id):
         raise HTTPException(status_code=404, detail="会话不存在")
-    
+
     return SessionInfo(
         session_id=session_id,
-        message_count=len(_session_store[session_id]),
-        created_at=_session_timestamps.get(session_id, 0)
+        message_count=len(session_store.get(session_id)),
+        created_at=time.time()
     )
 
 
@@ -861,14 +721,13 @@ async def get_session(session_id: str):
 async def delete_session(session_id: str):
     """
     删除会话。
-    
-    - 清除会话的所有对话历史
+
+    - 清除会话的所有对话历史（Redis key 或内存条目）
     """
-    if session_id not in _session_store:
+    if not session_store.exists(session_id):
         raise HTTPException(status_code=404, detail="会话不存在")
-    
-    _session_store.pop(session_id, None)
-    _session_timestamps.pop(session_id, None)
+
+    session_store.delete(session_id)
     logger.info(f"删除会话: {session_id}")
     return {"status": "deleted", "session_id": session_id}
 
@@ -877,16 +736,12 @@ async def delete_session(session_id: str):
 async def get_session_history(session_id: str):
     """
     获取会话的完整对话历史。
-    
-    - 返回所有用户问题和助手回答
     """
-    if session_id not in _session_store:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    
+    history = session_store.get(session_id)
     return {
         "session_id": session_id,
-        "history": _session_store[session_id],
-        "message_count": len(_session_store[session_id])
+        "history": history,
+        "message_count": len(history)
     }
 
 
@@ -985,47 +840,30 @@ async def upload_user_document(
         
         logger.info(f"用户 {user_id} 上传文档: {file.filename} (ID: {document_id})")
         
-        # 异步处理文档
-        def process_document_async():
-            try:
-                from user_vectorstore import process_user_document
-                
-                # 使用缓存的嵌入模型
-                embeddings = get_embeddings()
-                
-                result = process_user_document(
-                    user_id=user_id,
-                    file_path=str(file_path),
-                    embedding_function=embeddings,
-                    chunk_size=CHUNK_SIZE,
-                    chunk_overlap=CHUNK_OVERLAP,
-                    original_filename=file.filename
-                )
-                
-                if result.get("success"):
-                    database.update_document_status(document_id, "completed")
-                    logger.info(f"文档处理完成: {file.filename}, 生成 {result.get('num_chunks')} 个文档块")
-                    
-                    # 清除用户检索器缓存，下次查询时重新构建
-                    if user_id in _user_retrievers_cache:
-                        del _user_retrievers_cache[user_id]
-                        logger.info(f"已清除用户 {user_id} 的检索器缓存")
-                else:
-                    database.update_document_status(document_id, "failed", result.get("error"))
-                    logger.error(f"文档处理失败: {result.get('error')}")
-                    
-            except Exception as e:
-                database.update_document_status(document_id, "failed", str(e))
-                logger.error(f"文档处理异常: {e}")
-        
-        threading.Thread(target=process_document_async, daemon=True).start()
+        # 异步处理文档：RQ 任务（worker 进程执行，不占 API 线程）
+        try:
+            task = enqueue_process_user_document(
+                user_id=user_id,
+                file_path=str(file_path),
+                original_filename=file.filename,
+                document_id=document_id,
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP,
+            )
+        except Exception as e:
+            logger.error(f"文档任务入队失败: {e}")
+            database.update_document_status(document_id, "failed", f"任务入队失败: {e}")
+            raise HTTPException(status_code=503, detail="任务队列不可用，请确认 Redis 与 worker 已启动")
+        _pending_user_tasks[user_id] = task.id
+        logger.info(f"文档处理任务已入队: {task.id}（文档: {file.filename}）")
         
         return UserDocumentResponse(
             success=True,
             document_id=document_id,
             filename=file.filename,
             status="processing",
-            message="文档上传成功，正在处理中"
+            task_id=task.id,
+            message=f"文档上传成功，正在处理中（task_id: {task.id}）"
         )
         
     except HTTPException:
