@@ -1,0 +1,41 @@
+name: RAGAS Evaluation Gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * 1" # 每周一 02:00 UTC
+  pull_request:
+    paths:
+      - "qa_chain.py"
+      - "vectorstore.py"
+      - "document_processor.py"
+      - "config.py"
+      - "embeddings.py"
+      - "llm_provider.py"
+      - "test_set.json"
+
+jobs:
+  ragas-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      HF_ENDPOINT: "https://hf-mirror.com"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 下载 bge-m3 本地模型
+        run: python scripts/download_bge_m3.py
+      - name: 运行 RAGAS 全指标评测（CI 门槛）
+        run: python end_to_end_evaluation.py --ragas --ci
+      - name: 上传评测报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ragas-eval-report
+          path: e2e_evaluation_report.json
