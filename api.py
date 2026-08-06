@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+import structlog
 import threading
 from pathlib import Path
 from typing import List, Optional
@@ -63,12 +64,11 @@ else:
 
 from vectorstore import build_or_load_vectorstore
 from qa_chain import build_retrieval_qa_chain, extract_sources, extract_cited_sources, invoke_chain_with_memory
+from logging_config import setup_logging, new_trace_id, bind_trace_id, clear_trace_id
 
 logger = logging.getLogger("policy_qa_api")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-)
+_request_logger = structlog.get_logger("policy_qa_api.request")
+setup_logging()
 
 try:
     from memory_manager import memory_manager
@@ -393,10 +393,22 @@ app.add_middleware(
 @app.middleware("http")
 async def request_logging(request: Request, call_next):
     start = time.time()
-    response = await call_next(request)
-    elapsed = (time.time() - start) * 1000
-    logger.info(f"{request.method} {request.url.path} - {response.status_code} ({elapsed:.1f}ms)")
-    return response
+    trace_id = new_trace_id()
+    bind_trace_id(trace_id)
+    try:
+        response = await call_next(request)
+        elapsed = (time.time() - start) * 1000
+        response.headers["X-Trace-Id"] = trace_id
+        _request_logger.info(
+            "request_completed",
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=round(elapsed, 1),
+        )
+        return response
+    finally:
+        clear_trace_id()
 
 
 # --------------- Endpoints ---------------
