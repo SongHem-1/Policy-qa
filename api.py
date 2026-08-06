@@ -27,6 +27,11 @@ from config import (
     CHUNK_SIZE, 
     CHUNK_OVERLAP,
     CHUNK_BY_SECTION,
+    USE_PARENT_CHILD,
+    PARENT_CHUNK_SIZE,
+    CHILD_CHUNK_SIZE,
+    CHILD_CHUNK_OVERLAP,
+    USE_METADATA_AUGMENT,
     USE_MINERU,
     DOC_PROCESSOR as CONFIG_DOC_PROCESSOR,
     EMBEDDING_MODEL
@@ -80,6 +85,7 @@ _chain_building = False
 _chain_error: Optional[str] = None
 _build_start_time = 0.0
 _original_documents = None  # 保存原始文档用于BM25
+_parent_documents = None  # 保存父块文档用于ParentChildRetriever
 
 # 缓存嵌入模型和用户检索器
 _embeddings_cache = None
@@ -96,7 +102,7 @@ def get_embeddings():
     global _embeddings_cache
     
     if _embeddings_cache is None:
-        from langchain_huggingface import HuggingFaceEmbeddings
+        from langchain_community.embeddings import HuggingFaceEmbeddings
         _embeddings_cache = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL,
             encode_kwargs={"normalize_embeddings": True},
@@ -125,7 +131,7 @@ def _ensure_directories() -> None:
 
 
 def _build_chain():
-    global _chain, _file_list, _chain_building, _chain_error, _original_documents
+    global _chain, _file_list, _chain_building, _chain_error, _original_documents, _parent_documents
 
     logger.info("开始构建检索链...")
 
@@ -140,8 +146,35 @@ def _build_chain():
                 {m.get("source", m.get("file_name", "未知来源")) for m in metadatas}
             )
             logger.info(f"向量数据库加载完成，已加载文件：{_file_list}")
-            # 从已有向量库加载时，没有原始文档，仅使用向量检索
-            qa = build_retrieval_qa_chain(vectorstore, documents=None)
+            # 尝试从缓存加载原始文档（用于BM25和自适应检索）
+            cached_docs = None
+            cache_path = Path(DATA_DIR) / "_documents_cache.pkl"
+            if cache_path.exists():
+                try:
+                    import pickle
+                    with open(cache_path, "rb") as f:
+                        cached_docs = pickle.load(f)
+                    _original_documents = cached_docs
+                    logger.info(f"从缓存加载 {len(cached_docs)} 个文档块")
+                except Exception as e:
+                    logger.warning(f"缓存文档加载失败: {e}")
+            
+            # 加载父块缓存（用于ParentChildRetriever）
+            parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
+            if USE_PARENT_CHILD and parent_cache_path.exists():
+                try:
+                    import pickle
+                    with open(parent_cache_path, "rb") as f:
+                        _parent_documents = pickle.load(f)
+                    logger.info(f"从缓存加载 {len(_parent_documents)} 个父块")
+                except Exception as e:
+                    logger.warning(f"父块缓存加载失败: {e}")
+            
+            qa = build_retrieval_qa_chain(
+                vectorstore, 
+                documents=cached_docs,
+                parent_documents=_parent_documents
+            )
             _chain = qa
             _chain_building = False
             return
@@ -152,7 +185,12 @@ def _build_chain():
         DATA_DIR, 
         chunk_size=CHUNK_SIZE, 
         overlap=CHUNK_OVERLAP,
-        chunk_by_section=CHUNK_BY_SECTION
+        chunk_by_section=CHUNK_BY_SECTION,
+        parent_child=USE_PARENT_CHILD,
+        parent_size=PARENT_CHUNK_SIZE,
+        child_size=CHILD_CHUNK_SIZE,
+        child_overlap=CHILD_CHUNK_OVERLAP,
+        augment_meta=USE_METADATA_AUGMENT,
     )
     if not documents:
         logger.warning("没有找到可用文档")
@@ -162,11 +200,35 @@ def _build_chain():
     logger.info("构建向量数据库...")
     vectorstore = build_or_load_vectorstore(documents)
     
-    # 保存原始文档用于BM25混合检索
+    # 保存原始文档用于BM25混合检索，并缓存到磁盘
     _original_documents = documents
+    try:
+        import pickle
+        cache_path = Path(DATA_DIR) / "_documents_cache.pkl"
+        with open(cache_path, "wb") as f:
+            pickle.dump(documents, f)
+        logger.info(f"文档缓存已保存: {len(documents)} 个文档块")
+    except Exception as e:
+        logger.warning(f"文档缓存保存失败: {e}")
+    
+    # 加载父块缓存（由load_and_split_pdfs自动保存）
+    if USE_PARENT_CHILD:
+        parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
+        if parent_cache_path.exists():
+            try:
+                import pickle
+                with open(parent_cache_path, "rb") as f:
+                    _parent_documents = pickle.load(f)
+                logger.info(f"父块缓存已加载: {len(_parent_documents)} 个父块")
+            except Exception as e:
+                logger.warning(f"父块缓存加载失败: {e}")
     
     logger.info("构建问答链（使用混合检索：BM25 + 向量）...")
-    qa = build_retrieval_qa_chain(vectorstore, documents=documents)
+    qa = build_retrieval_qa_chain(
+        vectorstore, 
+        documents=documents,
+        parent_documents=_parent_documents
+    )
     _file_list = sorted({doc.metadata.get("source", "未知来源") for doc in documents})
     _chain = qa
     _chain_building = False
@@ -403,22 +465,18 @@ async def query(req: QueryRequest):
         # 如果有用户ID，使用缓存的用户检索器
         if req.user_id:
             try:
-                # 检查缓存
-                if req.user_id in _user_retrievers_cache:
-                    current_chain = _user_retrievers_cache[req.user_id]
-                    logger.info(f"用户 {req.user_id}: 使用缓存的联合检索器")
-                else:
-                    # 构建新的检索器
+                if req.user_id not in _user_retrievers_cache:
+                    # 构建新的检索器（内部会自动判断用户是否有个人文档）
                     from qa_chain import build_retrieval_qa_chain
                     vectorstore = build_or_load_vectorstore([])
                     user_chain = build_retrieval_qa_chain(
                         vectorstore, 
                         documents=_original_documents,
-                        user_id=req.user_id
+                        user_id=req.user_id,
+                        parent_documents=_parent_documents
                     )
                     _user_retrievers_cache[req.user_id] = user_chain
-                    current_chain = user_chain
-                    logger.info(f"用户 {req.user_id}: 创建并缓存联合检索器（公用+个人数据库）")
+                current_chain = _user_retrievers_cache[req.user_id]
             except Exception as e:
                 logger.error(f"创建用户检索链失败: {e}，使用默认链")
         
@@ -520,17 +578,38 @@ async def rebuild_knowledge_base(force: bool = Query(default=False, description=
             
             try:
                 logger.info("开始强制完全重建知识库...")
-                documents = load_and_split_pdfs(DATA_DIR, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+                documents = load_and_split_pdfs(
+                    DATA_DIR, 
+                    chunk_size=CHUNK_SIZE, 
+                    overlap=CHUNK_OVERLAP,
+                    parent_child=USE_PARENT_CHILD,
+                    parent_size=PARENT_CHUNK_SIZE,
+                    child_size=CHILD_CHUNK_SIZE,
+                    child_overlap=CHILD_CHUNK_OVERLAP,
+                    augment_meta=USE_METADATA_AUGMENT,
+                )
                 if not documents:
                     _chain_error = "没有找到可用文档"
                     _chain_building = False
                     return
                 vectorstore = build_or_load_vectorstore(documents, force_rebuild=True)
                 
-                global _original_documents
+                global _original_documents, _parent_documents
                 _original_documents = documents
                 
-                qa = build_retrieval_qa_chain(vectorstore, documents=documents)
+                # 加载父块缓存
+                if USE_PARENT_CHILD:
+                    parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
+                    if parent_cache_path.exists():
+                        import pickle
+                        with open(parent_cache_path, "rb") as f:
+                            _parent_documents = pickle.load(f)
+                
+                qa = build_retrieval_qa_chain(
+                    vectorstore, 
+                    documents=documents,
+                    parent_documents=_parent_documents
+                )
                 _file_list = sorted({doc.metadata.get("source", "未知来源") for doc in documents})
                 _chain = qa
                 logger.info(f"完全重建完成，共加载 {len(_file_list)} 个文件")
@@ -574,7 +653,7 @@ async def rebuild_knowledge_base(force: bool = Query(default=False, description=
                 
                 import tempfile
                 import shutil
-                from langchain_huggingface import HuggingFaceEmbeddings
+                from langchain_community.embeddings import HuggingFaceEmbeddings
                 
                 embeddings = HuggingFaceEmbeddings(
                     model_name=EMBEDDING_MODEL,
@@ -591,7 +670,16 @@ async def rebuild_knowledge_base(force: bool = Query(default=False, description=
                             dst_file = Path(temp_dir) / pdf_file
                             shutil.copy2(src_file, dst_file)
                         
-                        new_documents = load_and_split_pdfs(temp_dir, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+                        new_documents = load_and_split_pdfs(
+                            temp_dir, 
+                            chunk_size=CHUNK_SIZE, 
+                            overlap=CHUNK_OVERLAP,
+                            parent_child=USE_PARENT_CHILD,
+                            parent_size=PARENT_CHUNK_SIZE,
+                            child_size=CHILD_CHUNK_SIZE,
+                            child_overlap=CHILD_CHUNK_OVERLAP,
+                            augment_meta=USE_METADATA_AUGMENT,
+                        )
                         
                         if new_documents:
                             # 去重：基于内容哈希
@@ -623,7 +711,11 @@ async def rebuild_knowledge_base(force: bool = Query(default=False, description=
                 if removed_files:
                     logger.info(f"已删除 {len(removed_files)} 个文件（向量库中数据保留）")
                 
-                qa = build_retrieval_qa_chain(vectorstore, documents=_original_documents)
+                qa = build_retrieval_qa_chain(
+                    vectorstore, 
+                    documents=_original_documents,
+                    parent_documents=_parent_documents
+                )
                 _file_list = current_pdfs
                 _chain = qa
                 
@@ -1067,10 +1159,11 @@ async def update_conversation_title(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"未处理异常: {exc}")
+    # 服务端保留完整异常（含堆栈）便于排查；客户端只收到统一结构，绝不暴露内部细节
+    logger.error("未处理异常", exc_info=exc)
     return JSONResponse(
         status_code=500,
-        content={"detail": f"服务器内部错误：{exc}", "status": "error"},
+        content={"code": 500, "msg": "Internal Server Error"},
     )
 
 
