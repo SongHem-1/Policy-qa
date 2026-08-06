@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 import chromadb
 
 from config import PERSIST_DIRECTORY, EMBEDDING_MODEL, ROOT_DIR
@@ -121,6 +121,15 @@ def get_user_vectorstore(user_id: int, embedding_function: HuggingFaceEmbeddings
             collection_name=f"user_{user_id}_documents"
         )
         
+        # 检查向量库是否真的有文档（空目录不算）
+        try:
+            collection_data = vectorstore._collection.get()
+            if len(collection_data.get("ids", [])) == 0:
+                print(f"⚠️ 用户 {user_id} 向量库为空，跳过")
+                return None
+        except Exception:
+            pass
+        
         return vectorstore
     except Exception as e:
         print(f"获取用户向量库失败: {e}")
@@ -145,6 +154,29 @@ def delete_user_vectorstore(user_id: int) -> bool:
         return True
     except Exception as e:
         print(f"删除用户向量库失败: {e}")
+        return False
+
+
+def delete_user_document_vectors(user_id: int, source_name: str, embedding_function: HuggingFaceEmbeddings) -> bool:
+    """按 source 过滤物理删除用户向量库中的文档向量（级联删除）。
+
+    Args:
+        user_id: 用户ID
+        source_name: 文档原始文件名（与入库时 metadata["source"] 一致）
+        embedding_function: 嵌入模型实例
+
+    Returns:
+        是否删除成功（向量库不存在视为成功；删除失败返回 False 由调用方记录）
+    """
+    vectorstore = get_user_vectorstore(user_id, embedding_function)
+    if vectorstore is None:
+        return True
+    try:
+        vectorstore._collection.delete(where={"source": source_name})
+        print(f"已删除用户 {user_id} 的文档向量: source={source_name}")
+        return True
+    except Exception as e:
+        print(f"删除用户文档向量失败: {e}")
         return False
 
 

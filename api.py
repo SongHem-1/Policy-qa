@@ -35,7 +35,8 @@ from config import (
     USE_METADATA_AUGMENT,
     USE_MINERU,
     DOC_PROCESSOR as CONFIG_DOC_PROCESSOR,
-    EMBEDDING_MODEL
+    EMBEDDING_MODEL,
+    compute_build_fingerprint,
 )
 import database
 from user_vectorstore import (
@@ -62,7 +63,7 @@ else:
         from document_processor_simple import load_and_split_pdfs
         DOC_PROCESSOR = "simple"
 
-from vectorstore import build_or_load_vectorstore
+from vectorstore import build_or_load_vectorstore, read_manifest, update_manifest_count
 from qa_chain import build_retrieval_qa_chain, extract_sources, extract_cited_sources, invoke_chain_with_memory
 from logging_config import setup_logging, new_trace_id, bind_trace_id, clear_trace_id
 
@@ -130,6 +131,56 @@ def _ensure_directories() -> None:
     Path(PERSIST_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
 
+def _cache_meta_path(cache_path: Path) -> Path:
+    """缓存指纹边车路径：_documents_cache.pkl -> _documents_cache.pkl.meta.json"""
+    return cache_path.with_suffix(cache_path.suffix + ".meta.json")
+
+
+def _save_cache_with_meta(cache_path: Path, data) -> None:
+    """保存 pickle 缓存并写入指纹边车，供加载时与向量库 manifest 互验"""
+    import pickle
+    with open(cache_path, "wb") as f:
+        pickle.dump(data, f)
+    meta = {"fingerprint": compute_build_fingerprint(), "created_at": time.time()}
+    with open(_cache_meta_path(cache_path), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+    logger.info(f"缓存已保存: {cache_path.name}（指纹 {meta['fingerprint']}）")
+
+
+def _load_cache_with_meta(cache_path: Path, manifest: Optional[dict]):
+    """加载缓存并校验指纹与向量库 manifest 一致；不一致返回 None（绝不静默使用旧缓存）"""
+    if not cache_path.exists():
+        return None
+    import pickle
+    try:
+        meta_path = _cache_meta_path(cache_path)
+        if not meta_path.exists():
+            logger.warning(f"缓存缺少指纹元数据，已跳过: {cache_path.name}")
+            return None
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        cache_fp = meta.get("fingerprint")
+        manifest_fp = (manifest or {}).get("fingerprint") if manifest else None
+
+        if manifest_fp is None:
+            # 旧库无清单：只信任与当前构建配置一致的缓存
+            if cache_fp != compute_build_fingerprint():
+                logger.warning(f"缓存指纹与当前构建配置不一致，已跳过: {cache_path.name}")
+                return None
+        elif not cache_fp or cache_fp != manifest_fp:
+            logger.warning(f"缓存指纹与向量库 manifest 不一致，已跳过: {cache_path.name}")
+            return None
+
+        if cache_fp != compute_build_fingerprint():
+            logger.warning(f"⚠️ 缓存与当前构建配置不一致（配置已变更），建议重建知识库: {cache_path.name}")
+
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        logger.warning(f"缓存加载失败: {cache_path.name} - {e}")
+        return None
+
+
 def _build_chain():
     global _chain, _file_list, _chain_building, _chain_error, _original_documents, _parent_documents
 
@@ -146,29 +197,26 @@ def _build_chain():
                 {m.get("source", m.get("file_name", "未知来源")) for m in metadatas}
             )
             logger.info(f"向量数据库加载完成，已加载文件：{_file_list}")
-            # 尝试从缓存加载原始文档（用于BM25和自适应检索）
-            cached_docs = None
+            # 从缓存加载原始文档（用于BM25和自适应检索），指纹校验不通过则降级为纯向量检索
+            manifest = read_manifest(PERSIST_DIRECTORY)
             cache_path = Path(DATA_DIR) / "_documents_cache.pkl"
-            if cache_path.exists():
-                try:
-                    import pickle
-                    with open(cache_path, "rb") as f:
-                        cached_docs = pickle.load(f)
-                    _original_documents = cached_docs
-                    logger.info(f"从缓存加载 {len(cached_docs)} 个文档块")
-                except Exception as e:
-                    logger.warning(f"缓存文档加载失败: {e}")
+            cached_docs = _load_cache_with_meta(cache_path, manifest)
+            if cached_docs:
+                _original_documents = cached_docs
+                logger.info(f"从缓存加载 {len(cached_docs)} 个文档块（指纹校验通过）")
+            else:
+                _original_documents = None
+                logger.warning("文档块缓存不可用（缺失/指纹不匹配），BM25与自适应检索降级为纯向量检索")
             
             # 加载父块缓存（用于ParentChildRetriever）
             parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
-            if USE_PARENT_CHILD and parent_cache_path.exists():
-                try:
-                    import pickle
-                    with open(parent_cache_path, "rb") as f:
-                        _parent_documents = pickle.load(f)
-                    logger.info(f"从缓存加载 {len(_parent_documents)} 个父块")
-                except Exception as e:
-                    logger.warning(f"父块缓存加载失败: {e}")
+            if USE_PARENT_CHILD:
+                _parent_documents = _load_cache_with_meta(parent_cache_path, manifest)
+                if _parent_documents:
+                    logger.info(f"从缓存加载 {len(_parent_documents)} 个父块（指纹校验通过）")
+                else:
+                    _parent_documents = None
+                    logger.warning("父块缓存不可用（缺失/指纹不匹配），ParentChildRetriever 将直接返回子块")
             
             qa = build_retrieval_qa_chain(
                 vectorstore, 
@@ -202,26 +250,16 @@ def _build_chain():
     
     # 保存原始文档用于BM25混合检索，并缓存到磁盘
     _original_documents = documents
-    try:
-        import pickle
-        cache_path = Path(DATA_DIR) / "_documents_cache.pkl"
-        with open(cache_path, "wb") as f:
-            pickle.dump(documents, f)
-        logger.info(f"文档缓存已保存: {len(documents)} 个文档块")
-    except Exception as e:
-        logger.warning(f"文档缓存保存失败: {e}")
+    _save_cache_with_meta(Path(DATA_DIR) / "_documents_cache.pkl", documents)
     
-    # 加载父块缓存（由load_and_split_pdfs自动保存）
+    # 加载父块缓存（由load_and_split_pdfs自动保存，已带指纹边车）
     if USE_PARENT_CHILD:
         parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
-        if parent_cache_path.exists():
-            try:
-                import pickle
-                with open(parent_cache_path, "rb") as f:
-                    _parent_documents = pickle.load(f)
-                logger.info(f"父块缓存已加载: {len(_parent_documents)} 个父块")
-            except Exception as e:
-                logger.warning(f"父块缓存加载失败: {e}")
+        _parent_documents = _load_cache_with_meta(parent_cache_path, read_manifest(PERSIST_DIRECTORY))
+        if _parent_documents:
+            logger.info(f"父块缓存已加载: {len(_parent_documents)} 个父块")
+        else:
+            logger.warning("父块缓存不可用（缺失/指纹不匹配）")
     
     logger.info("构建问答链（使用混合检索：BM25 + 向量）...")
     qa = build_retrieval_qa_chain(
@@ -608,14 +646,12 @@ async def rebuild_knowledge_base(force: bool = Query(default=False, description=
                 
                 global _original_documents, _parent_documents
                 _original_documents = documents
+                _save_cache_with_meta(Path(DATA_DIR) / "_documents_cache.pkl", documents)
                 
-                # 加载父块缓存
+                # 加载父块缓存（带指纹校验）
                 if USE_PARENT_CHILD:
                     parent_cache_path = Path(DATA_DIR) / "_parent_documents_cache.pkl"
-                    if parent_cache_path.exists():
-                        import pickle
-                        with open(parent_cache_path, "rb") as f:
-                            _parent_documents = pickle.load(f)
+                    _parent_documents = _load_cache_with_meta(parent_cache_path, read_manifest(PERSIST_DIRECTORY))
                 
                 qa = build_retrieval_qa_chain(
                     vectorstore, 
@@ -710,12 +746,14 @@ async def rebuild_knowledge_base(force: bool = Query(default=False, description=
                             
                             if unique_docs:
                                 vectorstore.add_documents(unique_docs)
+                                update_manifest_count(vectorstore, PERSIST_DIRECTORY)
                                 logger.info(f"已添加 {len(unique_docs)} 个唯一文档块")
                         
                         global _original_documents
                         if _original_documents is None:
                             _original_documents = []
                         _original_documents.extend(new_documents)
+                        _save_cache_with_meta(Path(DATA_DIR) / "_documents_cache.pkl", _original_documents)
                         
                     finally:
                         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1019,23 +1057,46 @@ async def get_user_documents(user_id: int):
 @app.delete("/api/v1/users/{user_id}/documents/{document_id}", tags=["用户文档"])
 async def delete_user_document(user_id: int, document_id: int):
     """
-    删除用户文档。
+    删除用户文档（级联删除）。
     
-    - 同时删除文件和向量库中的数据
+    - 删除 SQLite 记录与源文件
+    - 按 source 过滤物理删除用户向量库中的向量
+    - 清空用户级检索器缓存，确保下次检索不命中已删内容
     """
+    document = database.get_document_by_id(document_id, user_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="文档不存在或无权访问")
+
     result = database.delete_user_document(document_id, user_id)
     
     if not result:
         raise HTTPException(status_code=404, detail="文档不存在或无权访问")
     
     success, file_path = result
+    original_filename = document["original_filename"]
+
+    # 1. 清空用户级检索器缓存（无论后续清理是否成功，检索器都必须重建）
+    _user_retrievers_cache.pop(user_id, None)
+    logger.info(f"已清空用户 {user_id} 的检索器缓存")
     
+    # 2. 删除源文件（尽力而为）
     if success and file_path:
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
         except Exception as e:
             logger.warning(f"删除文件失败: {e}")
+
+    # 3. 级联删除向量：按 source 过滤物理删除
+    try:
+        from user_vectorstore import delete_user_document_vectors
+        ok = delete_user_document_vectors(user_id, original_filename, get_embeddings())
+        if ok:
+            logger.info(f"用户 {user_id} 文档向量已删除: {original_filename}")
+        else:
+            logger.error(f"用户 {user_id} 文档向量删除失败（SQLite 记录已删除，需手动清理）: {original_filename}")
+    except Exception as e:
+        logger.error(f"级联删除向量失败: {e}")
     
     return {
         "success": True,
