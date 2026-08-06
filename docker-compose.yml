@@ -1,0 +1,72 @@
+services:
+  api:
+    build: .
+    container_name: policy-qa-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+      - ${MODEL_DIR:-./MML12-v2}:/app/MML12-v2:ro
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      - ZHIPU_API_KEY=${ZHIPU_API_KEY}
+      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - LLM_PROVIDER=${LLM_PROVIDER:-zhipu}
+      - OPENAI_MODEL=${OPENAI_MODEL:-glm-4-flash}
+      - DATA_DIR=data
+      - PERSIST_DIRECTORY=chroma_db
+      - USE_MINERU=${USE_MINERU:-False}
+      - USE_RERANKER=${USE_RERANKER:-True}
+      - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-base}
+      - RERANKER_TOP_K=${RERANKER_TOP_K:-3}
+      - RERANKER_THRESHOLD=${RERANKER_THRESHOLD:-0.3}
+      - BM25_WEIGHT=${BM25_WEIGHT:-0.5}
+      - VECTOR_WEIGHT=${VECTOR_WEIGHT:-0.5}
+      - RETRIEVAL_K=${RETRIEVAL_K:-10}
+      - USE_PARENT_CHILD=${USE_PARENT_CHILD:-True}
+      - PARENT_CHUNK_SIZE=${PARENT_CHUNK_SIZE:-2000}
+      - CHILD_CHUNK_SIZE=${CHILD_CHUNK_SIZE:-500}
+      - CHILD_CHUNK_OVERLAP=${CHILD_CHUNK_OVERLAP:-50}
+      - USE_METADATA_AUGMENT=${USE_METADATA_AUGMENT:-True}
+      - USE_KEYWORD_EXTRACT=${USE_KEYWORD_EXTRACT:-True}
+      - USE_ADAPTIVE_RETRIEVAL=${USE_ADAPTIVE_RETRIEVAL:-True}
+      - USE_QUERY_EXPANSION=${USE_QUERY_EXPANSION:-True}
+      - CHUNK_SIZE=${CHUNK_SIZE:-500}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
+      - CHUNK_BY_SECTION=${CHUNK_BY_SECTION:-True}
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    # 就绪探针（readiness）：知识库构建完成（status == "ok"）前不对外提供流量，
+    # 避免启动期间请求涌入导致超时堆积。
+    # Docker Compose 仅支持单个 healthcheck，start_period 承担 startupProbe 的慢启动保护语义；
+    # K8s 生产环境应拆分为独立的 startupProbe / livenessProbe / readinessProbe。
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,json; d=json.load(urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)); assert d.get('status') == 'ok', d"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: policy-qa-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-7862}:7862"
+    environment:
+      - API_BASE_URL=http://api:8000/api/v1
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7862
+      - ZHIPU_API_KEY=${ZHIPU_API_KEY}
+    command: python app.py
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  hf_cache:
+    driver: local
