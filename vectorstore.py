@@ -14,10 +14,17 @@ from langchain.retrievers import ContextualCompressionRetriever
 from langchain_core.retrievers import BaseRetriever
 from pydantic import Field
 
-from config import EMBEDDING_MODEL, PERSIST_DIRECTORY
+from config import EMBEDDING_MODEL, PERSIST_DIRECTORY, compute_build_fingerprint
 
 import os
 import ssl
+import json
+import time
+
+import chromadb
+
+# 缓存重排序模型，避免重复加载
+_reranker_cache: dict = {}
 
 
 class ManualRerankerRetriever(BaseRetriever):
@@ -70,7 +77,7 @@ class CombinedRetriever(BaseRetriever):
     public_retriever: BaseRetriever = Field(..., description="公用数据库检索器")
     user_retriever: Optional[BaseRetriever] = Field(None, description="用户个人数据库检索器")
     public_weight: float = Field(default=0.7, description="公用数据库权重")
-    user_weight: float = Field(default=0.3, description="用户数据库权重")
+    user_weight: float = Field(default=0.15, description="用户数据库权重")
     
     class Config:
         arbitrary_types_allowed = True
@@ -105,23 +112,34 @@ class CombinedRetriever(BaseRetriever):
             except Exception as e:
                 print(f"   ❌ 用户数据库检索失败: {e}")
         
-        # 按来源类型排序：用户文档优先
-        seen = set()
-        unique_docs = []
+        # 内容去重：用户文档如果与公用文档内容高度相似，保留公用文档（文件名更规范）
+        content_seen = set()
+        public_content_set = set()
+        
+        # 先收集公用文档内容指纹
+        for doc in all_docs:
+            if doc.metadata.get("source_type") == "public":
+                fingerprint = doc.page_content[:100].strip()
+                public_content_set.add(fingerprint)
+        
         user_docs = []
         public_docs = []
-        
         for doc in all_docs:
-            doc_id = f"{doc.metadata.get('source', '')}_{doc.page_content[:50]}"
-            if doc_id not in seen:
-                seen.add(doc_id)
-                if doc.metadata.get("source_type") == "user":
-                    user_docs.append(doc)
-                else:
-                    public_docs.append(doc)
+            fingerprint = doc.page_content[:100].strip()
+            if fingerprint in content_seen:
+                continue
+            content_seen.add(fingerprint)
+            
+            if doc.metadata.get("source_type") == "user":
+                # 用户文档内容与公用文档重复 → 跳过（保留公用版，文件名更规范）
+                if fingerprint in public_content_set:
+                    continue
+                user_docs.append(doc)
+            else:
+                public_docs.append(doc)
         
-        # 用户文档排在前面
-        unique_docs = user_docs + public_docs
+        # 公用文档优先，用户独有文档在后
+        unique_docs = public_docs + user_docs
         
         print(f"   ✅ 合并后共 {len(unique_docs)} 个唯一文档（用户: {len(user_docs)}, 公用: {len(public_docs)}）")
         print(f"🔍 CombinedRetriever 检索完成\n")
@@ -132,6 +150,70 @@ class CombinedRetriever(BaseRetriever):
         """异步检索"""
         return self._get_relevant_documents(query)
 
+
+class ParentChildRetriever(BaseRetriever):
+    """父子块检索器：用子块检索，返回父块
+    
+    核心逻辑：
+    1. 子块已向量化入库，用 base_retriever 检索最相关的子块
+    2. 通过子块的 metadata["parent_id"] 找到对应的父块
+    3. 返回父块（更大上下文），去重合并
+    """
+    
+    base_retriever: Any = Field(..., description="基础检索器（检索子块）")
+    parent_documents: List[Document] = Field(default_factory=list, description="父块列表")
+    
+    class Config:
+        arbitrary_types_allowed = True
+    
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        """检索：子块检索 → 父块返回"""
+        child_docs = self.base_retriever.invoke(query)
+        
+        if not child_docs:
+            return []
+        
+        if not self.parent_documents:
+            print("⚠️ ParentChildRetriever: 无父块缓存，直接返回子块")
+            return child_docs
+        
+        print(f"\n🧩 父子块检索: 检索到 {len(child_docs)} 个子块")
+        
+        parent_map = {}
+        for pdoc in self.parent_documents:
+            pid = pdoc.metadata.get("parent_id", "")
+            if pid:
+                parent_map[pid] = pdoc
+        
+        seen_parent_ids = set()
+        result_docs = []
+        
+        for child_doc in child_docs:
+            parent_id = child_doc.metadata.get("parent_id", "")
+            if parent_id and parent_id in parent_map:
+                if parent_id not in seen_parent_ids:
+                    seen_parent_ids.add(parent_id)
+                    parent_doc = parent_map[parent_id]
+                    new_doc = Document(
+                        page_content=parent_doc.page_content,
+                        metadata={
+                            **parent_doc.metadata,
+                            "child_source": child_doc.metadata.get("source", ""),
+                            "child_page": child_doc.metadata.get("page", ""),
+                            "child_score": child_doc.metadata.get("relevance_score", 0),
+                            "source_type": child_doc.metadata.get("source_type", "public"),
+                        }
+                    )
+                    result_docs.append(new_doc)
+            else:
+                result_docs.append(child_doc)
+        
+        print(f"   ✅ 映射到 {len(result_docs)} 个父块（去重后）")
+        return result_docs
+    
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        return self._get_relevant_documents(query)
+
 def _create_ssl_context():
     """创建SSL上下文以解决证书验证问题"""
     ctx = ssl.create_default_context()
@@ -140,96 +222,192 @@ def _create_ssl_context():
     return ctx
 
 
+# ---------------- 集合双缓冲区与构建清单 ----------------
+# 固定两个命名集合交替写入，manifest 记录谁是 active；切换前旧集合始终可用。
+ACTIVE_COLLECTION_LEGACY = "langchain"  # 兼容旧版本默认集合名
+COLLECTION_A = "langchain_a"
+COLLECTION_B = "langchain_b"
+MANIFEST_FILE = "manifest.json"
+
+
+def _manifest_path(persist_directory: str) -> Path:
+    return Path(persist_directory) / MANIFEST_FILE
+
+
+def read_manifest(persist_directory: str) -> Optional[dict]:
+    """读取构建清单；不存在或损坏时返回 None"""
+    path = _manifest_path(persist_directory)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ 读取清单失败: {e}")
+        return None
+
+
+def write_manifest(persist_directory: str, manifest: dict) -> None:
+    """原子写入清单：先写临时文件，再 os.replace 原子替换"""
+    path = _manifest_path(persist_directory)
+    tmp_path = path.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def update_manifest_count(db: Chroma, persist_directory: str) -> None:
+    """向量增量变更后刷新清单中的 document_count"""
+    manifest = read_manifest(persist_directory) or {}
+    try:
+        manifest["document_count"] = db._collection.count()
+        write_manifest(persist_directory, manifest)
+    except Exception as e:
+        print(f"⚠️ 更新清单计数失败: {e}")
+
+
+def _collection_exists(client, name: str) -> bool:
+    try:
+        client.get_collection(name)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_delete_collection(client, name: str) -> None:
+    try:
+        client.delete_collection(name)
+        print(f"  已删除集合: {name}")
+    except Exception:
+        pass
+
+
+def _load_embeddings():
+    """加载嵌入模型"""
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    print("使用 langchain_community.embeddings.HuggingFaceEmbeddings")
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    print(f"嵌入模型: {EMBEDDING_MODEL}")
+    return embeddings
+
+
+def _rebuild_double_buffer(client, embeddings, documents: List[Document], persist_directory: str) -> Chroma:
+    """双缓冲区重建：写入非 active 集合 -> 验证 -> 原子切换 -> 删除旧集合
+
+    任一步失败都不会破坏当前 active 集合，替代原来 shutil.rmtree 删库的重建方式。
+    """
+    manifest = read_manifest(persist_directory) or {}
+    active = manifest.get("active_collection")
+    target = COLLECTION_A if active == COLLECTION_B else COLLECTION_B
+
+    print(f"双缓冲区重建：active={active or '（旧库/无清单）'}，写入目标={target}")
+
+    # 1. 清空目标集合，保证从零写入
+    _safe_delete_collection(client, target)
+
+    # 2. 写入新集合
+    db = Chroma.from_documents(
+        documents,
+        embeddings,
+        client=client,
+        collection_name=target,
+    )
+
+    # 3. 验证：数量校验 + 冒烟查询
+    count = db._collection.count()
+    if count != len(documents):
+        raise RuntimeError(f"向量入库数量不一致: 期望 {len(documents)}，实际 {count}")
+    if count > 0:
+        try:
+            # 用 langchain 封装执行冒烟查询，确保走我们配置的嵌入模型，
+            # 而不是 Chroma collection 自带的默认 ONNX 嵌入函数
+            db.similarity_search("验证", k=1)
+        except Exception as e:
+            raise RuntimeError(f"冒烟查询失败: {e}")
+    print(f"✅ 新集合 {target} 验证通过：{count} 个向量")
+
+    # 4. 原子切换：先写清单（指向新集合），再删除旧集合
+    write_manifest(persist_directory, {
+        "active_collection": target,
+        "fingerprint": compute_build_fingerprint(),
+        "document_count": count,
+        "created_at": time.time(),
+    })
+
+    if active and active != target:
+        _safe_delete_collection(client, active)
+    elif active is None and _collection_exists(client, ACTIVE_COLLECTION_LEGACY) and ACTIVE_COLLECTION_LEGACY != target:
+        # 旧库默认集合在切换后删除，释放空间
+        _safe_delete_collection(client, ACTIVE_COLLECTION_LEGACY)
+
+    try:
+        client.persist()  # 兼容旧版 chromadb；0.4+ 自动持久化
+    except Exception:
+        pass
+
+    return db
+
+
 def build_or_load_vectorstore(documents: List[Document], persist_directory: str = PERSIST_DIRECTORY, force_rebuild: bool = False) -> Chroma:
-    """构建或加载持久化的 Chroma 向量数据库。
-    
-    Args:
-        documents: 文档列表（为空时尝试加载已有向量库）
-        persist_directory: 持久化目录路径
-        force_rebuild: 是否强制重建（忽略已有数据）
+    """构建或加载持久化 Chroma 向量库（双缓冲区原子切换）。
+
+    - documents 为空：加载 active 集合（按 manifest），并校验指纹一致性
+    - documents 非空：双缓冲区重建（写入非 active 集合 -> 验证 -> 原子切换）
+    - force_rebuild 与普通构建语义一致，均走双缓冲区
     """
     persist_path = Path(persist_directory)
     persist_path.mkdir(parents=True, exist_ok=True)
 
     print("初始化嵌入模型...")
-    
     try:
-        from langchain_huggingface import HuggingFaceEmbeddings
-        print("使用 langchain_huggingface.HuggingFaceEmbeddings")
-        embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            encode_kwargs={"normalize_embeddings": True},
-        )
-    except ImportError:
-        print("回退到 langchain_community.HuggingFaceEmbeddings")
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            encode_kwargs={"normalize_embeddings": True},
-        )
+        embeddings = _load_embeddings()
     except Exception as e:
         print(f"嵌入模型初始化失败: {e}")
         raise
 
-    print(f"嵌入模型: {EMBEDDING_MODEL}")
+    client = chromadb.PersistentClient(path=str(persist_path))
 
-    has_existing_db = any(persist_path.iterdir())
-    
-    if has_existing_db and not force_rebuild and not documents:
-        try:
-            print("加载已存在的向量数据库...")
-            db = Chroma(persist_directory=str(persist_path), embedding_function=embeddings)
-            collection_count = db._collection.count()
-            print(f"已加载 {collection_count} 个向量")
-            return db
-        except Exception as e:
-            print(f"加载现有向量数据库失败，将重新构建: {e}")
-
+    # ---- 加载模式 ----
     if not documents:
-        raise ValueError("向量库不存在且未提供文档，无法构建向量数据库")
+        manifest = read_manifest(persist_directory)
+        active = manifest.get("active_collection") if manifest else None
 
-    print("构建新的向量数据库...")
-    
-    if has_existing_db:
-        try:
-            print(f"清空旧向量数据库...")
-            # 先尝试关闭现有连接
-            try:
-                temp_db = Chroma(persist_directory=str(persist_path), embedding_function=embeddings)
-                temp_db._client.close()
-                del temp_db
-            except:
-                pass
-            
-            # 等待文件释放
-            import time
-            time.sleep(1)
-            
-            # 直接删除整个collection
-            import shutil
-            if persist_path.exists():
-                shutil.rmtree(str(persist_path))
-                persist_path.mkdir(parents=True, exist_ok=True)
-                print("✅ 旧向量数据库已清空")
-        except Exception as e:
-            print(f"清空旧数据失败（将覆盖）: {e}")
-            print("⚠️ 建议：请关闭所有API服务进程后重新启动")
+        # 指纹校验：向量库指纹与当前配置不符时告警（不阻塞，提示重建）
+        if manifest and manifest.get("fingerprint") and manifest["fingerprint"] != compute_build_fingerprint():
+            print("⚠️ 向量库构建指纹与当前配置不一致（嵌入模型或分块参数已变化），建议重建知识库")
 
-    db = Chroma.from_documents(
-        documents,
-        embeddings,
-        persist_directory=str(persist_path),
-    )
-    
-    try:
-        db.persist()
-    except:
-        pass
-    
-    collection_count = db._collection.count()
-    print(f"向量数据库构建完成，共 {collection_count} 个向量")
-    
-    return db
+        loaded = None
+        candidates = ([active] if active else []) + [ACTIVE_COLLECTION_LEGACY]
+        for name in candidates:
+            if _collection_exists(client, name):
+                try:
+                    loaded = Chroma(client=client, collection_name=name, embedding_function=embeddings)
+                    break
+                except Exception as e:
+                    print(f"加载集合 {name} 失败: {e}")
+
+        if loaded is None:
+            raise ValueError("向量库不存在且未提供文档，无法构建向量数据库")
+
+        count = loaded._collection.count()
+        print(f"已加载 {count} 个向量（集合: {loaded._collection.name}）")
+
+        # 旧库迁移：补齐清单，便于后续双缓冲区重建与缓存指纹校验
+        if not manifest:
+            write_manifest(persist_directory, {
+                "active_collection": loaded._collection.name,
+                "fingerprint": compute_build_fingerprint(),
+                "document_count": count,
+                "created_at": time.time(),
+            })
+        return loaded
+
+    # ---- 构建/重建模式 ----
+    print("强制重建（双缓冲区）..." if force_rebuild else "构建新的向量数据库（双缓冲区）...")
+    return _rebuild_double_buffer(client, embeddings, documents, str(persist_path))
 
 
 def create_hybrid_retriever(
@@ -260,7 +438,7 @@ def create_hybrid_retriever(
     print(f"创建混合检索器（BM25权重: {bm25_weight}, 向量权重: {vector_weight}）...")
     
     # 向量检索器 - 如果使用重排序，需要检索更多候选文档
-    retrieval_k = k * 4 if use_reranker else k
+    retrieval_k = k * 2 if use_reranker else k
     vector_retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": retrieval_k}
@@ -295,10 +473,17 @@ def create_hybrid_retriever(
     if use_reranker:
         try:
             from reranker import create_reranker
-            reranker_model, compressor = create_reranker(
-                top_k=reranker_top_k,
-                threshold=reranker_threshold
-            )
+            # 使用缓存的模型，避免重复加载
+            cache_key = f"{reranker_top_k}_{reranker_threshold}"
+            if cache_key not in _reranker_cache:
+                reranker_model, compressor = create_reranker(
+                    top_k=reranker_top_k,
+                    threshold=reranker_threshold
+                )
+                _reranker_cache[cache_key] = (reranker_model, compressor)
+            else:
+                reranker_model, compressor = _reranker_cache[cache_key]
+                print("✅ 重排序模型从缓存加载")
             
             if compressor:
                 # 使用ContextualCompressionRetriever包装

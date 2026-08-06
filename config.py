@@ -46,6 +46,17 @@ VECTOR_WEIGHT = float(os.getenv("VECTOR_WEIGHT", "0.5"))
 
 CHUNK_BY_SECTION = os.getenv("CHUNK_BY_SECTION", "False").strip().lower() == "true"
 
+USE_PARENT_CHILD = os.getenv("USE_PARENT_CHILD", "True").strip().lower() == "true"
+PARENT_CHUNK_SIZE = int(os.getenv("PARENT_CHUNK_SIZE", "2000"))
+CHILD_CHUNK_SIZE = int(os.getenv("CHILD_CHUNK_SIZE", "500"))
+CHILD_CHUNK_OVERLAP = int(os.getenv("CHILD_CHUNK_OVERLAP", "50"))
+USE_METADATA_AUGMENT = os.getenv("USE_METADATA_AUGMENT", "True").strip().lower() == "true"
+USE_KEYWORD_EXTRACT = os.getenv("USE_KEYWORD_EXTRACT", "True").strip().lower() == "true"
+
+USE_ADAPTIVE_RETRIEVAL = os.getenv("USE_ADAPTIVE_RETRIEVAL", "True").strip().lower() == "true"
+USE_QUERY_EXPANSION = os.getenv("USE_QUERY_EXPANSION", "True").strip().lower() == "true"
+RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "3"))
+
 
 def validate_config() -> None:
     """检查运行配置中的关键环境变量是否已正确设置。"""
@@ -67,7 +78,53 @@ def validate_config() -> None:
         print(f"✅ 重排序已启用: {RERANKER_MODEL} (Top {RERANKER_TOP_K}, 阈值: {RERANKER_THRESHOLD})")
     
     # 验证分块策略
-    if CHUNK_BY_SECTION:
+    if USE_PARENT_CHILD:
+        print(f"✅ 分块策略: 父子块检索 (父块={PARENT_CHUNK_SIZE}, 子块={CHILD_CHUNK_SIZE}, overlap={CHILD_CHUNK_OVERLAP})")
+        if USE_METADATA_AUGMENT:
+            print(f"   ✅ 元数据增强已启用")
+            if USE_KEYWORD_EXTRACT:
+                print(f"   ✅ 关键词提取已启用")
+        else:
+            print(f"   ⚠️ 元数据增强已禁用")
+    elif CHUNK_BY_SECTION:
         print("✅ 分块策略: 按章节/条款分块")
     else:
         print(f"✅ 分块策略: 固定长度分块 (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
+    
+    # 验证自适应检索
+    if USE_ADAPTIVE_RETRIEVAL:
+        print(f"✅ 自适应检索已启用（查询分类 + 策略路由）")
+        if USE_QUERY_EXPANSION:
+            print("   ✅ 查询扩展已启用")
+        else:
+            print("   ⚠️ 查询扩展已禁用")
+    else:
+        print("⚠️ 自适应检索已禁用，使用固定权重混合检索")
+
+import hashlib
+import json
+
+# 参与构建指纹的配置键：任一变化都会使指纹变化，从而让旧缓存自动失效
+BUILD_FINGERPRINT_KEYS = [
+    "EMBEDDING_MODEL",
+    "USE_MINERU",
+    "CHUNK_SIZE",
+    "CHUNK_OVERLAP",
+    "CHUNK_BY_SECTION",
+    "USE_PARENT_CHILD",
+    "PARENT_CHUNK_SIZE",
+    "CHILD_CHUNK_SIZE",
+    "CHILD_CHUNK_OVERLAP",
+    "USE_METADATA_AUGMENT",
+    "USE_KEYWORD_EXTRACT",
+]
+
+
+def compute_build_fingerprint() -> str:
+    """计算构建指纹（嵌入模型 + 分块参数）。
+
+    用于校验向量库 manifest、_documents_cache.pkl、父块缓存是否来自同一次构建。
+    """
+    payload = {key: globals().get(key) for key in BUILD_FINGERPRINT_KEYS}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
