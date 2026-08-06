@@ -266,6 +266,16 @@ def update_manifest_count(db: Chroma, persist_directory: str) -> None:
         print(f"⚠️ 更新清单计数失败: {e}")
 
 
+def delete_documents_by_source(db: Chroma, sources: List[str]) -> None:
+    """按 source 元数据物理删除向量（增量重建/级联删除共用）"""
+    for source in sources:
+        try:
+            db._collection.delete(where={"source": source})
+            print(f"  已删除 source={source} 的向量")
+        except Exception as e:
+            print(f"  删除 source={source} 向量失败: {e}")
+
+
 def _collection_exists(client, name: str) -> bool:
     try:
         client.get_collection(name)
@@ -327,10 +337,12 @@ def _rebuild_double_buffer(client, embeddings, documents: List[Document], persis
     print(f"✅ 新集合 {target} 验证通过：{count} 个向量")
 
     # 4. 原子切换：先写清单（指向新集合），再删除旧集合
+    source_files = sorted({d.metadata.get("source", "") for d in documents})
     write_manifest(persist_directory, {
         "active_collection": target,
         "fingerprint": compute_build_fingerprint(),
         "document_count": count,
+        "source_files": source_files,
         "created_at": time.time(),
     })
 
@@ -394,10 +406,16 @@ def build_or_load_vectorstore(documents: List[Document], persist_directory: str 
 
         # 旧库迁移：补齐清单，便于后续双缓冲区重建与缓存指纹校验
         if not manifest:
+            try:
+                metas = loaded._collection.get()["metadatas"]
+                sources = sorted({m.get("source", "") for m in metas if m})
+            except Exception:
+                sources = []
             write_manifest(persist_directory, {
                 "active_collection": loaded._collection.name,
                 "fingerprint": compute_build_fingerprint(),
                 "document_count": count,
+                "source_files": sources,
                 "created_at": time.time(),
             })
         return loaded
