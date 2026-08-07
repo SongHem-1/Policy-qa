@@ -15,6 +15,7 @@ import os
 import warnings
 import json
 import time
+import hashlib
 
 from config import USE_KEYWORD_EXTRACT, compute_build_fingerprint
 
@@ -362,9 +363,13 @@ def split_parent_child(
     # 步骤2: 构建父块文档
     parent_docs = []
     parent_page_map = {}
-    
+
+    # parent_id 需全局唯一：按文件从 0 重新编号会导致跨文件键冲突，
+    # ParentChildRetriever 的 parent_map 会错误地覆盖为最后一个文件的父块
+    source_key = hashlib.md5(source_name.encode("utf-8")).hexdigest()[:8]
+
     for i, parent_text in enumerate(parent_chunks):
-        parent_id = f"parent_{i}"
+        parent_id = f"parent_{source_key}_{i}"
         parent_page_map[parent_id] = parent_text
         
         page_num = 0

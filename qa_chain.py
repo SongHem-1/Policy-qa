@@ -106,6 +106,118 @@ def format_docs_with_citations(docs: List[Document]) -> str:
     return "\n".join(formatted_docs)
 
 
+def build_retriever(
+    vectorstore: Chroma,
+    documents: List[Document] = None,
+    parent_documents: List[Document] = None,
+    user_id: int = None,
+    adaptive: bool = USE_ADAPTIVE_RETRIEVAL,
+):
+    """构建检索器（检索链与离线检索评测共用）。
+
+    Args:
+        vectorstore: 向量数据库（公用数据库）
+        documents: 原始文档列表（用于 BM25 混合检索）
+        parent_documents: 父块文档列表（用于 ParentChildRetriever）
+        user_id: 用户ID（如果提供，将同时检索用户个人数据库）
+        adaptive: 是否启用自适应检索（LLM 路由）。离线评测可传 False 以完全离线运行
+    """
+    llm_provider = get_llm_provider()
+
+    if adaptive and documents:
+        # 自适应检索模式：为每种策略创建不同的检索器
+        retrievers = {}
+        for strategy, cfg in STRATEGY_CONFIG.items():
+            ret = create_hybrid_retriever(
+                vectorstore,
+                documents,
+                k=RETRIEVAL_K,
+                use_reranker=USE_RERANKER,
+                reranker_top_k=RERANKER_TOP_K,
+                reranker_threshold=RERANKER_THRESHOLD,
+                bm25_weight=cfg["bm25_weight"],
+                vector_weight=cfg["vector_weight"]
+            )
+            retrievers[strategy] = ret
+
+        retriever = AdaptiveRetriever(
+            retrievers=retrievers,
+            llm=llm_provider,
+            use_expansion=USE_QUERY_EXPANSION,
+            default_strategy="混合"
+        )
+        print(f"✅ 自适应检索器已启用（{len(retrievers)} 种策略，查询扩展: {'开启' if USE_QUERY_EXPANSION else '关闭'}）")
+    else:
+        # 传统固定权重模式
+        retriever = create_hybrid_retriever(
+            vectorstore,
+            documents,
+            k=RETRIEVAL_K,
+            use_reranker=USE_RERANKER,
+            reranker_top_k=RERANKER_TOP_K,
+            reranker_threshold=RERANKER_THRESHOLD,
+            bm25_weight=BM25_WEIGHT,
+            vector_weight=VECTOR_WEIGHT
+        )
+        print("⚠️ 使用固定权重混合检索（自适应检索已禁用）")
+
+    # 如果启用父子块检索，用 ParentChildRetriever 包装基础检索器
+    if USE_PARENT_CHILD and parent_documents:
+        from vectorstore import ParentChildRetriever
+        retriever = ParentChildRetriever(
+            base_retriever=retriever,
+            parent_documents=parent_documents
+        )
+        print(f"✅ 父子块检索已启用（子块检索 → 父块返回，{len(parent_documents)} 个父块）")
+
+    # 如果有用户ID，创建联合检索器
+    if user_id:
+        try:
+            from user_vectorstore import get_user_vectorstore
+            from vectorstore import CombinedRetriever
+
+            # 先查数据库，确认用户是否真的上传过文件
+            has_db_uploads = False
+            try:
+                from database import get_user_uploads
+                uploads = get_user_uploads(user_id)
+                has_db_uploads = len(uploads) > 0
+            except Exception:
+                has_db_uploads = False
+
+            if not has_db_uploads:
+                print(f"⚠️ 用户 {user_id}: 数据库无上传记录，跳过个人数据库")
+            else:
+                try:
+                    from api import get_embeddings
+                    embeddings = get_embeddings()
+                except ImportError:
+                    from embeddings import create_embeddings
+                    embeddings = create_embeddings()
+
+                user_vectorstore = get_user_vectorstore(user_id, embeddings)
+                if user_vectorstore:
+                    user_retriever = create_hybrid_retriever(
+                        user_vectorstore,
+                        documents=None,
+                        k=RETRIEVAL_K,
+                        use_reranker=False
+                    )
+                    retriever = CombinedRetriever(
+                        public_retriever=retriever,
+                        user_retriever=user_retriever,
+                        public_weight=0.7,
+                        user_weight=0.15
+                    )
+                    print(f"✅ 用户 {user_id}: 联合检索器（公用+{len(uploads)}个个人文档）")
+                else:
+                    print(f"⚠️ 用户 {user_id}: 个人向量库为空，仅使用公用数据库")
+        except Exception as e:
+            print(f"⚠️ 创建用户检索器失败: {e}，仅使用公用数据库")
+
+    return retriever
+
+
 def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document] = None, user_id: int = None, parent_documents: List[Document] = None):
     """构建支持多轮对话的检索问答链
     
@@ -121,107 +233,17 @@ def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document]
     # 策略模式：通过供应商抽象获取模型实例，主备降级与超时重试由 llm_provider 层负责
     llm_provider = get_llm_provider()
     llm = llm_provider.llm
-    
-    # 创建检索器
-    if USE_ADAPTIVE_RETRIEVAL and documents:
-        # 自适应检索模式：为每种策略创建不同的检索器
-        retrievers = {}
-        for strategy, cfg in STRATEGY_CONFIG.items():
-            ret = create_hybrid_retriever(
-                vectorstore,
-                documents,
-                k=RETRIEVAL_K,
-                use_reranker=USE_RERANKER,
-                reranker_top_k=RERANKER_TOP_K,
-                reranker_threshold=RERANKER_THRESHOLD,
-                bm25_weight=cfg["bm25_weight"],
-                vector_weight=cfg["vector_weight"]
-            )
-            retrievers[strategy] = ret
-        
-        public_retriever = AdaptiveRetriever(
-            retrievers=retrievers,
-            llm=llm_provider,
-            use_expansion=USE_QUERY_EXPANSION,
-            default_strategy="混合"
-        )
-        print(f"✅ 自适应检索器已启用（{len(retrievers)} 种策略，查询扩展: {'开启' if USE_QUERY_EXPANSION else '关闭'}）")
-    else:
-        # 传统固定权重模式
-        public_retriever = create_hybrid_retriever(
-            vectorstore, 
-            documents, 
-            k=RETRIEVAL_K,
-            use_reranker=USE_RERANKER,
-            reranker_top_k=RERANKER_TOP_K,
-            reranker_threshold=RERANKER_THRESHOLD,
-            bm25_weight=BM25_WEIGHT,
-            vector_weight=VECTOR_WEIGHT
-        )
-        print("⚠️ 使用固定权重混合检索（自适应检索已禁用）")
-    
-    # 如果启用父子块检索，用ParentChildRetriever包装基础检索器
-    if USE_PARENT_CHILD and parent_documents:
-        from vectorstore import ParentChildRetriever
-        public_retriever = ParentChildRetriever(
-            base_retriever=public_retriever,
-            parent_documents=parent_documents
-        )
-        print(f"✅ 父子块检索已启用（子块检索 → 父块返回，{len(parent_documents)} 个父块）")
-    
-    # 如果有用户ID，创建联合检索器
-    if user_id:
-        try:
-            from user_vectorstore import get_user_vectorstore
-            from vectorstore import CombinedRetriever
-            
-            # 先查数据库，确认用户是否真的上传过文件
-            has_db_uploads = False
-            try:
-                from database import get_user_uploads
-                uploads = get_user_uploads(user_id)
-                has_db_uploads = len(uploads) > 0
-            except Exception:
-                has_db_uploads = False  # 数据库异常时安全起见，不加载用户库
-            
-            if not has_db_uploads:
-                retriever = public_retriever
-                print(f"⚠️ 用户 {user_id}: 数据库无上传记录，跳过个人数据库")
-            else:
-                # 使用缓存的嵌入模型
-                try:
-                    from api import get_embeddings
-                    embeddings = get_embeddings()
-                except ImportError:
-                    from embeddings import create_embeddings
-                    embeddings = create_embeddings()
-                
-                user_vectorstore = get_user_vectorstore(user_id, embeddings)
-                
-                if user_vectorstore:
-                    user_retriever = create_hybrid_retriever(
-                        user_vectorstore,
-                        documents=None,  # 用户文档不参与BM25（避免重复）
-                        k=RETRIEVAL_K,
-                        use_reranker=False  # 用户文档少，不重排序
-                    )
-                    
-                    retriever = CombinedRetriever(
-                        public_retriever=public_retriever,
-                        user_retriever=user_retriever,
-                        public_weight=0.7,
-                        user_weight=0.15
-                    )
-                    print(f"✅ 用户 {user_id}: 联合检索器（公用+{len(uploads)}个个人文档）")
-                else:
-                    retriever = public_retriever
-                    print(f"⚠️ 用户 {user_id}: 个人向量库为空，仅使用公用数据库")
-        except Exception as e:
-            print(f"⚠️ 创建用户检索器失败: {e}，仅使用公用数据库")
-            retriever = public_retriever
-    else:
-        retriever = public_retriever
-    
+    # 策略模式：通过供应商抽象获取模型实例，主备降级与超时重试由 llm_provider 层负责
+    llm_provider = get_llm_provider()
+    llm = llm_provider.llm
+
+    retriever = build_retriever(
+        vectorstore,
+        documents=documents,
+        parent_documents=parent_documents,
+        user_id=user_id,
+        adaptive=USE_ADAPTIVE_RETRIEVAL,
+    )
     history_aware_retriever = create_history_aware_retriever(
         llm, retriever, CONTEXTUALIZE_PROMPT
     )
