@@ -28,6 +28,24 @@ class LLMProviderError(RuntimeError):
     """LLM 调用在重试耗尽后仍失败（供上层决定降级或终止）"""
 
 
+try:
+    from langchain_zhipu import ChatZhipuAI as _ChatZhipuAI
+
+    class ZhipuJudgeChatZhipuAI(_ChatZhipuAI):
+        """评测（judge）用智谱模型：ragas 会把 temperature 设为 1/n（长小数），
+        而智谱 API 限制小数点后 2 位，这里统一截断。"""
+
+        def get_model_kwargs(self):
+            kwargs = super().get_model_kwargs()
+            temp = kwargs.get("temperature")
+            if temp is not None:
+                kwargs["temperature"] = round(float(temp), 2)
+            return kwargs
+
+except ImportError:
+    ZhipuJudgeChatZhipuAI = None
+
+
 class BaseLLMProvider(ABC):
     """LLM 供应商统一接口"""
 
@@ -44,6 +62,10 @@ class BaseLLMProvider(ABC):
     @abstractmethod
     def llm(self) -> Any:
         """返回 LangChain 兼容模型实例（供检索链构建使用）"""
+
+    def judge_llm(self) -> Any:
+        """评测（judge）用模型实例；默认与 llm 相同，子类可按需覆盖"""
+        return self.llm
 
     def invoke(self, prompt: Union[str, List[Any]], **kwargs) -> Any:
         """调用模型并返回响应（统一内置超时重试 + 指数退避）"""
@@ -88,17 +110,28 @@ class ZhipuProvider(BaseLLMProvider):
         super().__init__(max_retries=max_retries)
         self.api_key = api_key
         self.model = model
-        self.base_url = base_url
+        # langchain_zhipu 4.1.x 的 _ask_remote 会把 "api/paas/v4/chat/completions"
+        # 拼到 base_url 之后，因此 base_url 必须是裸域名；兼容旧的带后缀配置
+        self.base_url = _normalize_zhipu_base_url(base_url)
         self.timeout = timeout
         if not api_key:
             raise LLMProviderError("缺少 ZHIPU_API_KEY")
         from langchain_zhipu import ChatZhipuAI
 
-        self._chat = ChatZhipuAI(api_key=api_key, model=model, base_url=base_url)
+        self._chat = ChatZhipuAI(api_key=api_key, model=model, base_url=self.base_url)
 
     @property
     def llm(self) -> Any:
         return self._chat
+
+    def judge_llm(self) -> Any:
+        if ZhipuJudgeChatZhipuAI is None:
+            return self._chat
+        return ZhipuJudgeChatZhipuAI(
+            api_key=self.api_key,
+            model=self.model,
+            base_url=self.base_url,
+        )
 
     def _invoke_once(self, prompt: Union[str, List[Any]], **kwargs) -> Any:
         return self._chat.invoke(prompt, **kwargs)
@@ -156,6 +189,9 @@ class FallbackLLMProvider(BaseLLMProvider):
         # 检索链使用主供应商的 LangChain 模型实例
         return self.primary.llm
 
+    def judge_llm(self) -> Any:
+        return self.primary.judge_llm()
+
     def _invoke_once(self, prompt: Union[str, List[Any]], **kwargs) -> Any:
         # Fallback 层整体覆写 invoke，此处仅满足抽象接口
         return self.primary._invoke_once(prompt, **kwargs)
@@ -171,6 +207,15 @@ class FallbackLLMProvider(BaseLLMProvider):
 
 
 _llm_provider: Optional[BaseLLMProvider] = None
+
+
+def _normalize_zhipu_base_url(base_url: str) -> str:
+    """兼容新旧两种 ZHIPU_BASE_URL 配置（裸域名 或 .../api/paas/v4 后缀）"""
+    url = (base_url or "").strip().rstrip("/")
+    suffix = "/api/paas/v4"
+    if url.endswith(suffix):
+        url = url[: -len(suffix)]
+    return url or "https://open.bigmodel.cn"
 
 
 def get_llm_provider() -> BaseLLMProvider:
