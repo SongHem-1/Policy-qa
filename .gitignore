@@ -59,6 +59,7 @@ data/_parent_documents_cache.pkl.meta.json
 logs/
 
 # Data files (keep structure, ignore content)
+data/*.pdf
 data/*.json
 data/*.db
 data/*.sqlite

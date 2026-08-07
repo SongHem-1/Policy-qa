@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.docker
+
+# Models (large files)
+MML12-v2/
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.ckpt
+
+# Data
+data/
+chroma_db/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Evaluation reports
+*_report.json
+test_set.json
+
+# Pickle caches
+*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Git
+.git/
+.gitignore
+
+# Batch scripts (not needed in container)
+*.bat
+
+# Test files
+test_*.py
+check_*.py
+download_*.py
+
+# Documentation
+*.md
+!README.md
+
+# Temp
+tmp/
+temp/
+*.tmp

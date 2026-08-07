@@ -1,0 +1,26 @@
+FROM python:3.10-slim-bookworm
+
+LABEL maintainer="policy-qa"
+LABEL description="Policy QA Web UI (Gradio)"
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --retries 5 \
+    -i https://mirrors.aliyun.com/pypi/simple \
+    --trusted-host mirrors.aliyun.com \
+    gradio requests python-dotenv
+
+COPY app.py config.py database.py ./
+
+RUN mkdir -p data
+
+EXPOSE 7862
+
+CMD ["python", "app.py"]

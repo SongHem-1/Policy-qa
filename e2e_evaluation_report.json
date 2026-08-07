@@ -1,0 +1,37 @@
+{
+  "evaluation_time": "2026-08-06 18:06:24",
+  "mode": "ragas",
+  "summary": {
+    "ragas_scores": {
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.49567302378722106,
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "answer_correctness": 0.4823016768122543
+    }
+  },
+  "per_case": [
+    {
+      "id": 1,
+      "question": "到2025年，数字中国建设的目标是什么？",
+      "answer_preview": "到2025年，数字中国建设的目标是：\n\n- 基本建成数字中国。数字基础设施全面夯实，新型基础设施加快建设，数字化发展基础更加坚实。\n- 数字化发展加速推进。数字技术与实体经济深度融合，在重点领域数字化应用取得显著成效。\n- 数字政府建设高效",
+      "ground_truth": "到2025年，基本形成横向打通、纵向贯通、协调有力的一体化推进格局，数字中国建设取得重要进展。",
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.9913460475744421,
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "answer_correctness": 0.8654834530591828
+    },
+    {
+      "id": 2,
+      "question": "请问《数字中国建设整体布局规划》中提到的“2522”整体框架具体指的是什么？",
+      "answer_preview": "在所有已上传的政策文件中均未检索到相关信息。",
+      "ground_truth": "2522整体框架指的是夯实数字基础设施和数据资源体系两大基础，推进数字技术与经济、政治、文化、社会、生态文明建设五位一体深度融合，强化数字技术创新体系和数字安全屏障两大能力，优化数字化发展国内国际两个环境。",
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.0,
+      "context_precision": 0.0,
+      "context_recall": 0.0,
+      "answer_correctness": 0.09911990056532571
+    }
+  ]
+}
